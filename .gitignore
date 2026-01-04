@@ -8,7 +8,9 @@
 !requirements.txt
 
 # Source code
+!predictor/
 !predictor/**
+!vae_recon/
 !vae_recon/**
 
 # ---- Python junk ----
