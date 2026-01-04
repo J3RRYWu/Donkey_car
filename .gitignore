@@ -1,0 +1,48 @@
+# Only track the source code folders the user requested.
+# Everything else in this workspace (data, frames, pretrained weights, results) stays local.
+*
+
+# Repo metadata/docs
+!.gitignore
+!README.md
+!requirements.txt
+
+# Source code
+!predictor/**
+!vae_recon/**
+
+# ---- Python junk ----
+**/__pycache__/
+**/*.py[cod]
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+
+# ---- Generated artifacts (keep out of git) ----
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.npz
+**/*.npy
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.webp
+**/*.log
+**/*.json
+
+# Predictor: exclude evaluation outputs + checkpoints
+predictor/eval_results/
+predictor/eval_results*/
+predictor/checkpoints/
+predictor/checkpoints*/
+
+# VAE recon: exclude checkpoints
+vae_recon/checkpoints_64x64/
+vae_recon/checkpoints*/
+
+
