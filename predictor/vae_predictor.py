@@ -6,7 +6,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import os
 import sys
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 
 # Prefer importing as a proper package (repo root on PYTHONPATH).
 # Fallback to the older "sys.path insert" behavior for backwards compatibility.
@@ -361,6 +361,170 @@ class VAEPredictor(nn.Module):
                 out = out.view(original_shape)
         
         return out
+
+    def _flatten_latent(self, z: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+        """Flatten latent to (B, D) or (B, T, D) for RNN/MLP processing.
+        Returns (z_flat, original_shape).
+        """
+        original_shape = tuple(z.shape)
+        if self.vae_encoder is not None:
+            if z.dim() == 4:
+                z_flat = z.view(z.size(0), -1)  # (B, C*H*W)
+            elif z.dim() == 5:
+                B, T = z.shape[:2]
+                z_flat = z.view(B, T, -1)       # (B, T, C*H*W)
+            else:
+                z_flat = z.view(z.size(0), -1)
+        else:
+            z_flat = z
+        return z_flat, original_shape
+
+    def _unflatten_latent(self, z_flat: torch.Tensor, original_shape: Tuple[int, ...]) -> torch.Tensor:
+        """Reshape flat latent back to original convolutional format if needed."""
+        if self.vae_encoder is None:
+            return z_flat
+        # Convolutional latent
+        if len(original_shape) == 4:
+            return z_flat.view(original_shape)
+        if len(original_shape) == 5:
+            return z_flat.view(original_shape)
+        # Fallback
+        return z_flat.view(original_shape)
+
+    def _rnn_step(self, x_step: torch.Tensor, hidden):
+        """Single-step forward through LSTM/GRU with dropout + output projection.
+        x_step: (B, Din)
+        Returns (y: (B, Dout), new_hidden)
+        """
+        if self.predictor_type == "lstm":
+            out, hidden = self.lstm(x_step.unsqueeze(1), hidden)  # (B,1,H)
+            out = self.dropout_pred(out)
+            y = self.lstm_out(out)[:, 0, :]  # (B, Dout)
+            return y, hidden
+        if self.predictor_type == "gru":
+            out, hidden = self.gru(x_step.unsqueeze(1), hidden)
+            out = self.dropout_pred(out)
+            y = self.gru_out(out)[:, 0, :]
+            return y, hidden
+        # MLP (no hidden state)
+        y = self.predictor(x_step)
+        return y, None
+
+    @torch.no_grad()
+    def predict_mc(
+        self,
+        z: torch.Tensor,
+        a: Optional[torch.Tensor] = None,
+        mc_samples: int = 20,
+        enable_dropout: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Monte-Carlo dropout uncertainty for one-step prediction in latent space.
+
+        Returns dict with:
+          - mean: (same shape as predict(z,a))
+          - std:  (same shape)
+          - samples: (S, ...) if mc_samples>1
+        """
+        if mc_samples < 1:
+            raise ValueError("mc_samples must be >= 1")
+        was_training = self.training
+        try:
+            if enable_dropout:
+                self.train()
+            else:
+                self.eval()
+            preds = []
+            for _ in range(int(mc_samples)):
+                preds.append(self.predict(z, a))
+            samples = torch.stack(preds, dim=0)  # (S, ...)
+            mean = samples.mean(dim=0)
+            std = samples.std(dim=0, unbiased=False) if mc_samples > 1 else torch.zeros_like(mean)
+            return {"mean": mean, "std": std, "samples": samples}
+        finally:
+            self.train(was_training)
+
+    def rollout_from_context(
+        self,
+        z_context: torch.Tensor,
+        steps: int,
+        a_full: Optional[torch.Tensor] = None,
+        context_action_len: Optional[int] = None,
+        start_action_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Sequence-to-sequence rollout with hidden-state carry.
+
+        - z_context: (B, Tctx, ...) latent context sequence.
+        - steps: number of future steps to predict.
+        - a_full: optional actions aligned to the *original* frame indices of the sampled window,
+          shape (B, L, action_dim). We will slice actions internally.
+        - context_action_len: number of actions to consume while priming hidden (default: Tctx-1).
+        - start_action_index: action index used for the first predicted step (default: Tctx-1).
+
+        Returns z_pred: (B, steps, ...) predicted future latents.
+        """
+        if steps <= 0:
+            raise ValueError("steps must be > 0")
+        if z_context.dim() != 5 and z_context.dim() != 3:
+            raise ValueError(f"Expected z_context to be sequence (B,T,...) but got shape {tuple(z_context.shape)}")
+
+        z_flat, orig = self._flatten_latent(z_context)  # (B,T,D)
+        if z_flat.dim() != 3:
+            raise ValueError("z_context must be a sequence")
+        B, Tctx, D = z_flat.shape
+        ctx_act_len = (Tctx - 1) if context_action_len is None else int(context_action_len)
+        start_a = (Tctx - 1) if start_action_index is None else int(start_action_index)
+        if ctx_act_len < 0:
+            ctx_act_len = 0
+
+        hidden = None
+
+        # Prime hidden on context transitions: use (z_t, a_t) -> predict z_{t+1}
+        if self.action_dim > 0 and a_full is not None:
+            a_ctx = a_full[:, :ctx_act_len, :] if ctx_act_len > 0 else None
+        else:
+            a_ctx = None
+
+        for t in range(ctx_act_len):
+            x_in = z_flat[:, t, :]  # (B,D)
+            if a_ctx is not None:
+                x_in = torch.cat([x_in, a_ctx[:, t, :]], dim=-1)
+            y, hidden = self._rnn_step(x_in, hidden)  # (B,D)
+            if self.residual_prediction:
+                y = y + z_flat[:, t, :]
+            # We do not use y here (teacher forced by context), we only advance hidden.
+
+        # Start rollout from the last context latent
+        z_cur = z_flat[:, Tctx - 1, :]  # (B,D)
+
+        # Slice actions for predicted steps
+        if self.action_dim > 0 and a_full is not None:
+            a_pred = a_full[:, start_a:start_a + steps, :]
+        else:
+            a_pred = None
+
+        outs = []
+        for k in range(steps):
+            x_in = z_cur
+            if a_pred is not None:
+                if k >= a_pred.size(1):
+                    a_k = a_pred[:, -1, :]
+                else:
+                    a_k = a_pred[:, k, :]
+                x_in = torch.cat([x_in, a_k], dim=-1)
+            y, hidden = self._rnn_step(x_in, hidden)
+            if self.residual_prediction:
+                y = y + z_cur
+            outs.append(y)
+            z_cur = y
+
+        out_flat = torch.stack(outs, dim=1)  # (B,steps,D)
+        # reshape back to conv latent if needed
+        if self.vae_encoder is not None:
+            # orig is (B,Tctx,C,H,W); build (B,steps,C,H,W)
+            B0, _, C, H, W = orig
+            out = out_flat.view(B0, steps, C, H, W)
+            return out
+        return out_flat
     
     def forward(self, x: torch.Tensor, a: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass: encode and predict.
@@ -407,11 +571,34 @@ class TrajectoryDataset(Dataset):
     Avoids loading all frames into RAM. Sequences do not cross file boundaries.
     """
     
-    def __init__(self, npz_paths: list, sequence_length: int = 16, 
-                 image_size: int = 224, normalize: bool = True):
+    def __init__(
+        self,
+        npz_paths: list,
+        sequence_length: int = 16,
+        image_size: int = 224,
+        normalize: bool = True,
+        input_length: int = 15,
+        target_length: int = 15,
+        target_offset: int = 1,
+    ):
         self.sequence_length = sequence_length
         self.image_size = image_size
         self.normalize = normalize
+        self.input_length = int(input_length)
+        self.target_length = int(target_length)
+        self.target_offset = int(target_offset)
+
+        # Sanity: frames_seq has length = sequence_length, and we slice:
+        # input:  [0 : input_length)
+        # target: [target_offset : target_offset + target_length)
+        # Old behavior: sequence_length=16, input_length=15, target_offset=1, target_length=15
+        min_seq_len = max(self.input_length, self.target_offset + self.target_length)
+        if self.sequence_length < min_seq_len:
+            raise ValueError(
+                f"TrajectoryDataset: sequence_length={self.sequence_length} is too small for "
+                f"input_length={self.input_length}, target_offset={self.target_offset}, "
+                f"target_length={self.target_length}. Need at least {min_seq_len}."
+            )
         
         # Hold per-file memory-mapped arrays and lengths
         self.files = []  # list of dicts with frames, states, actions, length, path
@@ -482,9 +669,15 @@ class TrajectoryDataset(Dataset):
         states_seq = f['states'][s:e]  # (16, 4)
         actions_seq = f['actions'][s:e]  # (16, 2)
         
-        # Input: frames 1-15, Target: frames 2-16
-        input_frames = frames_seq[:-1]
-        target_frames = frames_seq[1:]
+        # Input/Target slicing (configurable).
+        # Old behavior (teacher forcing next-step):
+        #   input_length=sequence_length-1, target_offset=1, target_length=sequence_length-1
+        # Non-overlap "future chunk" example:
+        #   input_length=15, target_offset=15, target_length=15, sequence_length>=30
+        input_frames = frames_seq[:self.input_length]
+        target_start = self.target_offset
+        target_end = self.target_offset + self.target_length
+        target_frames = frames_seq[target_start:target_end]
         
         # Convert to tensors lazily, normalize at this step to avoid duplicating arrays
         input_frames_t = torch.from_numpy(input_frames.astype(np.float32))
@@ -505,7 +698,13 @@ class TrajectoryDataset(Dataset):
             'input_frames': input_frames_t,
             'target_frames': target_frames_t,
             'states': torch.from_numpy(states_seq),
-            'actions': actions_t
+            'actions': actions_t,
+            # Include slicing metadata for downstream alignment (collates to shape (B,))
+            'input_length': torch.tensor(self.input_length, dtype=torch.long),
+            'target_length': torch.tensor(self.target_length, dtype=torch.long),
+            'target_offset': torch.tensor(self.target_offset, dtype=torch.long),
+            # Useful for evaluation to locate the original NPZ memmap window (collates to shape (B,))
+            'global_idx': torch.tensor(int(idx), dtype=torch.long),
         }
 
 
@@ -540,7 +739,8 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
                 target_jitter_scale: float = 0.0,
                 detach_target: bool = True,  # Should be True when VAE is frozen
                 open_loop_steps: int = 0,
-                open_loop_weight: float = 0.0) -> dict:
+                open_loop_weight: float = 0.0,
+                latent_sampling: bool = False) -> dict:
     """Train one epoch"""
     model.train()
     total_loss = 0.0
@@ -558,17 +758,24 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
     for batch in dataloader:
         input_frames = batch['input_frames'].to(device)  # (B, 15, 3, H, W)
         target_frames = batch['target_frames'].to(device)  # (B, 15, 3, H, W)
-        B, T = input_frames.shape[:2]
+        B, T_in = input_frames.shape[:2]
+        T_tgt = target_frames.shape[1]
+        target_offset = int(batch.get('target_offset', torch.tensor(1))[0].item()) if isinstance(batch.get('target_offset', 1), torch.Tensor) else int(batch.get('target_offset', 1))
+        start_idx = int(target_offset) - 1
+        if start_idx < 0 or start_idx >= int(T_in):
+            raise ValueError(
+                f"Bad alignment: need 0 <= target_offset-1 < input_length. "
+                f"Got target_offset={target_offset}, input_length={T_in}."
+            )
         # Optional input noise
         if input_noise_std > 0:
             input_frames = torch.clamp(
                 input_frames + torch.randn_like(input_frames) * float(input_noise_std), 0.0, 1.0
             )
         # Prepare actions sequence if using them
-        actions_seq = None
+        actions_full = None
         if use_actions and 'actions' in batch:
-            # actions for t=1..15 to predict 2..16
-            actions_seq = batch['actions'][:, :-1, :].to(device)  # (B,15,action_dim)
+            actions_full = batch['actions'].to(device)  # (B, L, action_dim)
         
         optimizer.zero_grad(set_to_none=True)
 
@@ -579,58 +786,62 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
         if use_amp:
             with amp.autocast('cuda'):
                 # Encode full sequences (avoid calling forward/predict)
-                B, T = input_frames.shape[:2]
-                in_flat = input_frames.reshape(B*T, *input_frames.shape[2:])
+                B, T_in = input_frames.shape[:2]
+                in_flat = input_frames.reshape(B*T_in, *input_frames.shape[2:])
                 mu_in, lv_in = model.encode(in_flat)
-                z_input = mu_in    # 不采样，直接用均值
+                z_input = model.reparameterize(mu_in, lv_in) if latent_sampling else mu_in
                 
                 # Reshape based on whether using VAE (convolutional) or default (vector)
                 if model.vae_encoder is not None:
                     # Convolutional: (B*T, C, H, W) -> (B, T, C, H, W)
-                    z_input = z_input.reshape(B, T, *z_input.shape[1:])
-                    mu = mu_in.reshape(B, T, *mu_in.shape[1:])
-                    logvar = lv_in.reshape(B, T, *lv_in.shape[1:])
+                    z_input = z_input.reshape(B, T_in, *z_input.shape[1:])
+                    mu = mu_in.reshape(B, T_in, *mu_in.shape[1:])
+                    logvar = lv_in.reshape(B, T_in, *lv_in.shape[1:])
                 else:
                     # Vector: (B*T, D) -> (B, T, D)
-                    z_input = z_input.reshape(B, T, -1)
-                    mu = mu_in.reshape(B, T, -1)
-                    logvar = lv_in.reshape(B, T, -1)
-                # Sequence prediction (optionally apply action dropout)
-                if model.predictor_type in ['lstm', 'gru']:
-                    # Apply action dropout if needed
-                    if actions_seq is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
-                        mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
-                        actions_seq = actions_seq * mask
-                    # predict() handles flattening and concatenation internally
-                    z_pred_seq = model.predict(z_input, actions_seq)  # (B, T, C, H, W) or (B, T, D)
-                else:
-                    # MLP predictor (predict() handles flattening internally)
-                    if actions_seq is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
-                        mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
-                        actions_seq = actions_seq * mask
-                    # predict() handles flattening and reshaping for both vector and convolutional latents
-                    z_pred_seq = model.predict(z_input, actions_seq)
+                    z_input = z_input.reshape(B, T_in, -1)
+                    mu = mu_in.reshape(B, T_in, -1)
+                    logvar = lv_in.reshape(B, T_in, -1)
+
                 # Targets: encode target frames
-                # Encode targets directly (avoid extra predictor compute)
-                B, T = target_frames.shape[:2]
-                tf_flat = target_frames.reshape(B*T, *target_frames.shape[2:])
+                B, T_tgt = target_frames.shape[:2]
+                tf_flat = target_frames.reshape(B*T_tgt, *target_frames.shape[2:])
                 if detach_target:
                     with torch.no_grad():
                         mu_t, logvar_t = model.encode(tf_flat)
                 else:
                     mu_t, logvar_t = model.encode(tf_flat)
-                
-                # Reshape based on whether using VAE (convolutional) or default (vector)
+                z_target_flat = model.reparameterize(mu_t, logvar_t) if latent_sampling else mu_t
+
                 if model.vae_encoder is not None:
-                    # Convolutional: (B*T, C, H, W) -> (B, T, C, H, W)
-                    mu_t = mu_t.reshape(B, T, *mu_t.shape[1:])
-                    logvar_t = logvar_t.reshape(B, T, *logvar_t.shape[1:])
+                    z_target_seq = z_target_flat.reshape(B, T_tgt, *z_target_flat.shape[1:])
                 else:
-                    # Vector: (B*T, D) -> (B, T, D)
-                    mu_t = mu_t.reshape(B, T, -1)
-                    logvar_t = logvar_t.reshape(B, T, -1)
-                # Target: use mu directly (no jitter needed since encoder is frozen)
-                z_target_seq = mu_t
+                    z_target_seq = z_target_flat.reshape(B, T_tgt, -1)
+
+                # Choose training mode based on slicing (teacher forcing vs seq2seq rollout)
+                teacher_forcing = (target_offset == 1 and T_tgt == T_in)
+
+                if teacher_forcing:
+                    actions_seq = None
+                    if actions_full is not None:
+                        actions_seq = actions_full[:, 0:T_in, :]
+                        if hasattr(model, '_act_drop') and model._act_drop > 0:
+                            mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
+                            actions_seq = actions_seq * mask
+                    z_pred_seq = model.predict(z_input, actions_seq)
+                else:
+                    # Seq2seq rollout from context; actions are sliced internally.
+                    if actions_full is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
+                        mask = (torch.rand_like(actions_full[..., :1]) > float(model._act_drop)).float()
+                        actions_full = actions_full * mask
+                    # The first target frame index is `target_offset`; to predict it we need action at (target_offset-1).
+                    z_pred_seq = model.rollout_from_context(
+                        z_context=z_input,
+                        steps=T_tgt,
+                        a_full=actions_full if actions_full is not None else None,
+                        context_action_len=max(0, T_in - 1),
+                        start_action_index=max(0, target_offset - 1),
+                    )
                 
                 # Compute loss over sequence (FP32)
                 # Flatten for loss computation
@@ -651,78 +862,73 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
                 
                 # Open-loop rollout loss (multi-step prediction)
                 if open_loop_steps > 0 and open_loop_weight > 0:
-                    # Get first frame's latent for open-loop rollout
-                    z_start = z_input[:, 0, ...]  # (B, C, H, W) or (B, D)
+                    # Start rollout from the frame right before the first target frame.
+                    # target_frames[:, 0] corresponds to predicting step=1 from input_frames[:, start_idx].
+                    z_start = z_input[:, start_idx, ...]  # (B, C, H, W) or (B, D)
                     
-                    # Get target latents for open-loop steps
-                    rollout_steps = min(open_loop_steps, T - 1)
+                    # Compare against target_frames[:, 0..rollout_steps-1]
+                    rollout_steps = min(int(open_loop_steps), int(T_tgt))
                     
                     if rollout_steps > 0:
-                        # Encode target frames for open-loop steps (if we have enough frames)
-                        if target_frames.shape[1] >= rollout_steps + 1:
-                            # Get target frames for rollout: frames 1 to rollout_steps+1
-                            target_rollout_frames = target_frames[:, :rollout_steps+1, ...]  # (B, rollout_steps+1, 3, H, W)
-                            target_rollout_flat = target_rollout_frames.reshape(B*(rollout_steps+1), *target_rollout_frames.shape[2:])
-                            
-                            # Encode target frames (detached, no grad)
-                            with torch.no_grad():
-                                mu_rollout_target, _ = model.encode(target_rollout_flat)
-                            
-                            # Reshape target latents
-                            if model.vae_encoder is not None:
-                                mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps+1, *mu_rollout_target.shape[1:])
+                        # Encode target frames for rollout: target_frames[0..rollout_steps-1]
+                        target_rollout_frames = target_frames[:, :rollout_steps, ...]  # (B, rollout_steps, 3, H, W)
+                        target_rollout_flat = target_rollout_frames.reshape(B*rollout_steps, *target_rollout_frames.shape[2:])
+                        
+                        with torch.no_grad():
+                            mu_rollout_target, _ = model.encode(target_rollout_flat)
+                        
+                        # Reshape target latents: (B, rollout_steps, ...)
+                        if model.vae_encoder is not None:
+                            mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps, *mu_rollout_target.shape[1:])
+                        else:
+                            mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps, -1)
+                        
+                        # Open-loop rollout: start from z_start, predict step by step
+                        z_rollout = z_start  # (B, C, H, W) or (B, D)
+                        rollout_losses = []
+                        
+                        # Get actions for rollout if available.
+                        # Step k (0-based) uses action at index (start_idx + k) for transition -> next frame.
+                        actions_rollout = None
+                        if actions_full is not None and getattr(model, "action_dim", 0) > 0:
+                            a0 = max(0, int(start_idx))
+                            a1 = min(actions_full.shape[1], a0 + rollout_steps)
+                            actions_rollout = actions_full[:, a0:a1, :]  # (B, <=rollout_steps, action_dim)
+                        
+                        for step in range(rollout_steps):
+                            # Predict next latent
+                            if actions_rollout is not None and actions_rollout.numel() > 0:
+                                if z_rollout.dim() == 4:  # Convolutional: (B, C, H, W)
+                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, C, H, W)
+                                else:  # Vector: (B, D)
+                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, D)
+                                # If we ran out of actions, repeat the last one.
+                                idx = min(step, actions_rollout.shape[1] - 1)
+                                a_step = actions_rollout[:, idx:idx+1, :]  # (B, 1, action_dim)
+                                z_next_pred = model.predict(z_rollout_expanded, a_step).squeeze(1)
                             else:
-                                mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps+1, -1)
-                            
-                            # Open-loop rollout: start from z_start, predict step by step
-                            z_rollout = z_start  # (B, C, H, W) or (B, D)
-                            rollout_losses = []
-                            
-                            # Get actions for rollout if available
-                            actions_rollout = None
-                            if actions_seq is not None and actions_seq.shape[1] >= rollout_steps:
-                                actions_rollout = actions_seq[:, :rollout_steps, :]  # (B, rollout_steps, action_dim)
-                            
-                            for step in range(rollout_steps):
-                                # Predict next latent
-                                if actions_rollout is not None:
-                                    # Single step prediction
-                                    if z_rollout.dim() == 4:  # Convolutional: (B, C, H, W)
-                                        z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, C, H, W)
-                                    else:  # Vector: (B, D)
-                                        z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, D)
-                                    
-                                    a_step = actions_rollout[:, step:step+1, :]  # (B, 1, action_dim)
-                                    z_next_pred = model.predict(z_rollout_expanded, a_step)  # (B, 1, C, H, W) or (B, 1, D)
-                                    z_next_pred = z_next_pred.squeeze(1)  # (B, C, H, W) or (B, D)
+                                if z_rollout.dim() == 4:
+                                    z_rollout_expanded = z_rollout.unsqueeze(1)
                                 else:
-                                    # Single step prediction without actions
-                                    if z_rollout.dim() == 4:  # Convolutional: (B, C, H, W)
-                                        z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, C, H, W)
-                                    else:  # Vector: (B, D)
-                                        z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, D)
-                                    
-                                    z_next_pred = model.predict(z_rollout_expanded, None)  # (B, 1, C, H, W) or (B, 1, D)
-                                    z_next_pred = z_next_pred.squeeze(1)  # (B, C, H, W) or (B, D)
-                                
-                                # Target latent for this step (frame step+1)
-                                z_target_step = mu_rollout_target[:, step+1, ...]  # (B, C, H, W) or (B, D)
-                                
-                                # Compute MSE loss for this step
-                                if model.vae_encoder is not None:
-                                    # Convolutional: flatten
-                                    z_pred_flat_step = z_next_pred.float().reshape(B, -1)
-                                    z_target_flat_step = z_target_step.float().reshape(B, -1)
-                                else:
-                                    # Vector: already flat
-                                    z_pred_flat_step = z_next_pred.float()
-                                    z_target_flat_step = z_target_step.float()
-                                
-                                step_loss = F.mse_loss(z_pred_flat_step, z_target_flat_step, reduction='mean')
-                                rollout_losses.append(step_loss)
-                                
-                                # Use predicted latent for next step (open-loop)
-                                z_rollout = z_next_pred.detach()  # Detach to prevent gradient accumulation
+                                    z_rollout_expanded = z_rollout.unsqueeze(1)
+                                z_next_pred = model.predict(z_rollout_expanded, None).squeeze(1)
+
+                            # Target latent for this step: aligns with target_frames[:, step]
+                            z_target_step = mu_rollout_target[:, step, ...]
+
+                            # Compute MSE loss for this step
+                            if model.vae_encoder is not None:
+                                z_pred_flat_step = z_next_pred.float().reshape(B, -1)
+                                z_target_flat_step = z_target_step.float().reshape(B, -1)
+                            else:
+                                z_pred_flat_step = z_next_pred.float()
+                                z_target_flat_step = z_target_step.float()
+
+                            step_loss = F.mse_loss(z_pred_flat_step, z_target_flat_step, reduction='mean')
+                            rollout_losses.append(step_loss)
+
+                            # Use predicted latent for next step (open-loop)
+                            z_rollout = z_next_pred.detach()
                             
                             # Average rollout loss
                             if rollout_losses:
@@ -739,58 +945,58 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
             scaler.update()
         else:
             # Encode (avoid calling forward/predict)
-            B, T = input_frames.shape[:2]
-            in_flat = input_frames.reshape(B*T, *input_frames.shape[2:])
+            B, T_in = input_frames.shape[:2]
+            in_flat = input_frames.reshape(B*T_in, *input_frames.shape[2:])
             mu_in, lv_in = model.encode(in_flat)
-            z_input = mu_in    # 不采样，直接用均值
+            z_input = model.reparameterize(mu_in, lv_in) if latent_sampling else mu_in
             
             # Reshape based on whether using VAE (convolutional) or default (vector)
             if model.vae_encoder is not None:
                 # Convolutional: (B*T, C, H, W) -> (B, T, C, H, W)
-                z_input = z_input.reshape(B, T, *z_input.shape[1:])
-                mu = mu_in.reshape(B, T, *mu_in.shape[1:])
-                logvar = lv_in.reshape(B, T, *lv_in.shape[1:])
+                z_input = z_input.reshape(B, T_in, *z_input.shape[1:])
+                mu = mu_in.reshape(B, T_in, *mu_in.shape[1:])
+                logvar = lv_in.reshape(B, T_in, *lv_in.shape[1:])
             else:
                 # Vector: (B*T, D) -> (B, T, D)
-                z_input = z_input.reshape(B, T, -1)
-                mu = mu_in.reshape(B, T, -1)
-                logvar = lv_in.reshape(B, T, -1)
+                z_input = z_input.reshape(B, T_in, -1)
+                mu = mu_in.reshape(B, T_in, -1)
+                logvar = lv_in.reshape(B, T_in, -1)
             
-            # Predict sequence (optionally apply action dropout)
-            if model.predictor_type in ['lstm', 'gru']:
-                if actions_seq is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
-                    mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
-                    actions_seq = actions_seq * mask
-                # Pass sequences directly to predict which handles residual connection
-                z_pred_seq = model.predict(z_input, actions_seq)
-            else:
-                # MLP predictor (predict() handles flattening internally)
-                if actions_seq is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
-                    mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
-                    actions_seq = actions_seq * mask
-                # predict() handles flattening and reshaping for both vector and convolutional latents
-                z_pred_seq = model.predict(z_input, actions_seq)
-            # Targets
-            # Encode targets directly (avoid extra predictor compute)
-            B, T = target_frames.shape[:2]
-            tf_flat = target_frames.reshape(B*T, *target_frames.shape[2:])
+            # Targets: encode targets directly
+            B, T_tgt = target_frames.shape[:2]
+            tf_flat = target_frames.reshape(B*T_tgt, *target_frames.shape[2:])
             if detach_target:
                 with torch.no_grad():
                     mu_t, logvar_t = model.encode(tf_flat)
             else:
                 mu_t, logvar_t = model.encode(tf_flat)
+            z_target_flat = model.reparameterize(mu_t, logvar_t) if latent_sampling else mu_t
             
-            # Reshape based on whether using VAE (convolutional) or default (vector)
             if model.vae_encoder is not None:
-                # Convolutional: (B*T, C, H, W) -> (B, T, C, H, W)
-                mu_t = mu_t.reshape(B, T, *mu_t.shape[1:])
-                logvar_t = logvar_t.reshape(B, T, *logvar_t.shape[1:])
+                z_target_seq = z_target_flat.reshape(B, T_tgt, *z_target_flat.shape[1:])
             else:
-                # Vector: (B*T, D) -> (B, T, D)
-                mu_t = mu_t.reshape(B, T, -1)
-                logvar_t = logvar_t.reshape(B, T, -1)
-            # Target: use mu directly (no jitter needed since encoder is frozen)
-            z_target_seq = mu_t
+                z_target_seq = z_target_flat.reshape(B, T_tgt, -1)
+
+            teacher_forcing = (target_offset == 1 and T_tgt == T_in)
+            if teacher_forcing:
+                actions_seq = None
+                if actions_full is not None:
+                    actions_seq = actions_full[:, 0:T_in, :]
+                    if hasattr(model, '_act_drop') and model._act_drop > 0:
+                        mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
+                        actions_seq = actions_seq * mask
+                z_pred_seq = model.predict(z_input, actions_seq)
+            else:
+                if actions_full is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
+                    mask = (torch.rand_like(actions_full[..., :1]) > float(model._act_drop)).float()
+                    actions_full = actions_full * mask
+                z_pred_seq = model.rollout_from_context(
+                    z_context=z_input,
+                    steps=T_tgt,
+                    a_full=actions_full if actions_full is not None else None,
+                    context_action_len=max(0, T_in - 1),
+                    start_action_index=max(0, target_offset - 1),
+                )
             
             # Loss FP32 - Simple MSE loss
             # Flatten for loss computation
@@ -811,78 +1017,58 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
             
             # Open-loop rollout loss (multi-step prediction) - same as AMP branch
             if open_loop_steps > 0 and open_loop_weight > 0:
-                # Get first frame's latent for open-loop rollout
-                z_start = z_input[:, 0, ...]  # (B, C, H, W) or (B, D)
+                z_start = z_input[:, start_idx, ...]  # aligned start
                 
-                # Get target latents for open-loop steps
-                rollout_steps = min(open_loop_steps, T - 1)
+                rollout_steps = min(int(open_loop_steps), int(T_tgt))
                 
                 if rollout_steps > 0:
-                    # Encode target frames for open-loop steps (if we have enough frames)
-                    if target_frames.shape[1] >= rollout_steps + 1:
-                        # Get target frames for rollout: frames 1 to rollout_steps+1
-                        target_rollout_frames = target_frames[:, :rollout_steps+1, ...]  # (B, rollout_steps+1, 3, H, W)
-                        target_rollout_flat = target_rollout_frames.reshape(B*(rollout_steps+1), *target_rollout_frames.shape[2:])
-                        
-                        # Encode target frames (detached, no grad)
-                        with torch.no_grad():
-                            mu_rollout_target, _ = model.encode(target_rollout_flat)
-                        
-                        # Reshape target latents
-                        if model.vae_encoder is not None:
-                            mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps+1, *mu_rollout_target.shape[1:])
+                    target_rollout_frames = target_frames[:, :rollout_steps, ...]  # (B, rollout_steps, 3, H, W)
+                    target_rollout_flat = target_rollout_frames.reshape(B*rollout_steps, *target_rollout_frames.shape[2:])
+                    
+                    with torch.no_grad():
+                        mu_rollout_target, _ = model.encode(target_rollout_flat)
+                    
+                    if model.vae_encoder is not None:
+                        mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps, *mu_rollout_target.shape[1:])
+                    else:
+                        mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps, -1)
+                    
+                    z_rollout = z_start
+                    rollout_losses = []
+                    
+                    actions_rollout = None
+                    if actions_full is not None and getattr(model, "action_dim", 0) > 0:
+                        a0 = max(0, int(start_idx))
+                        a1 = min(actions_full.shape[1], a0 + rollout_steps)
+                        actions_rollout = actions_full[:, a0:a1, :]
+                    
+                    for step in range(rollout_steps):
+                        # Predict next latent
+                        if actions_rollout is not None and actions_rollout.numel() > 0:
+                            if z_rollout.dim() == 4:
+                                z_rollout_expanded = z_rollout.unsqueeze(1)
+                            else:
+                                z_rollout_expanded = z_rollout.unsqueeze(1)
+                            idx = min(step, actions_rollout.shape[1] - 1)
+                            a_step = actions_rollout[:, idx:idx+1, :]
+                            z_next_pred = model.predict(z_rollout_expanded, a_step).squeeze(1)
                         else:
-                            mu_rollout_target = mu_rollout_target.reshape(B, rollout_steps+1, -1)
-                        
-                        # Open-loop rollout: start from z_start, predict step by step
-                        z_rollout = z_start  # (B, C, H, W) or (B, D)
-                        rollout_losses = []
-                        
-                        # Get actions for rollout if available
-                        actions_rollout = None
-                        if actions_seq is not None and actions_seq.shape[1] >= rollout_steps:
-                            actions_rollout = actions_seq[:, :rollout_steps, :]  # (B, rollout_steps, action_dim)
-                        
-                        for step in range(rollout_steps):
-                            # Predict next latent
-                            if actions_rollout is not None:
-                                # Single step prediction
-                                if z_rollout.dim() == 4:  # Convolutional: (B, C, H, W)
-                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, C, H, W)
-                                else:  # Vector: (B, D)
-                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, D)
-                                
-                                a_step = actions_rollout[:, step:step+1, :]  # (B, 1, action_dim)
-                                z_next_pred = model.predict(z_rollout_expanded, a_step)  # (B, 1, C, H, W) or (B, 1, D)
-                                z_next_pred = z_next_pred.squeeze(1)  # (B, C, H, W) or (B, D)
-                            else:
-                                # Single step prediction without actions
-                                if z_rollout.dim() == 4:  # Convolutional: (B, C, H, W)
-                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, C, H, W)
-                                else:  # Vector: (B, D)
-                                    z_rollout_expanded = z_rollout.unsqueeze(1)  # (B, 1, D)
-                                
-                                z_next_pred = model.predict(z_rollout_expanded, None)  # (B, 1, C, H, W) or (B, 1, D)
-                                z_next_pred = z_next_pred.squeeze(1)  # (B, C, H, W) or (B, D)
-                            
-                            # Target latent for this step (frame step+1)
-                            z_target_step = mu_rollout_target[:, step+1, ...]  # (B, C, H, W) or (B, D)
-                            
-                            # Compute MSE loss for this step
-                            if model.vae_encoder is not None:
-                                # Convolutional: flatten
-                                z_pred_flat_step = z_next_pred.float().reshape(B, -1)
-                                z_target_flat_step = z_target_step.float().reshape(B, -1)
-                            else:
-                                # Vector: already flat
-                                z_pred_flat_step = z_next_pred.float()
-                                z_target_flat_step = z_target_step.float()
-                            
-                            step_loss = F.mse_loss(z_pred_flat_step, z_target_flat_step, reduction='mean')
-                            rollout_losses.append(step_loss)
-                            
-                            # Use predicted latent for next step (open-loop)
-                            z_rollout = z_next_pred.detach()  # Detach to prevent gradient accumulation
+                            z_rollout_expanded = z_rollout.unsqueeze(1)
+                            z_next_pred = model.predict(z_rollout_expanded, None).squeeze(1)
+
+                        z_target_step = mu_rollout_target[:, step, ...]
+
+                        if model.vae_encoder is not None:
+                            z_pred_flat_step = z_next_pred.float().reshape(B, -1)
+                            z_target_flat_step = z_target_step.float().reshape(B, -1)
+                        else:
+                            z_pred_flat_step = z_next_pred.float()
+                            z_target_flat_step = z_target_step.float()
+
+                        step_loss = F.mse_loss(z_pred_flat_step, z_target_flat_step, reduction='mean')
+                        rollout_losses.append(step_loss)
+
+                        z_rollout = z_next_pred.detach()
                         
                         # Average rollout loss
                         if rollout_losses:
@@ -955,7 +1141,9 @@ def validate_epoch(model: VAEPredictor, dataloader: DataLoader, device: torch.de
             
             actions_seq = None
             if 'actions' in batch and model.action_dim > 0:
-                actions_seq = batch['actions'][:, :-1, :].to(device)
+                B, T_in = input_frames.shape[:2]
+                actions_full = batch['actions'].to(device)
+                actions_seq = actions_full[:, 0:T_in, :]
             
             # Forward pass
             z_seq, z_pred_seq, mu_seq, logvar_seq = model(input_frames, actions_seq)
@@ -1010,9 +1198,24 @@ def save_model(model: VAEPredictor, path: str, epoch: int = 0, optimizer: Option
     
     if args is not None:
         checkpoint['args'] = args
-    
-    torch.save(checkpoint, path)
-    print(f"Model saved to {path}")
+
+    # Robust checkpoint saving on Windows:
+    # - write to a temp file first, then atomically replace (avoids partial/corrupt files)
+    # - if PyTorch zip writer fails (common with AV/file sync/disk hiccups), retry legacy format
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        try:
+            torch.save(checkpoint, tmp_path)
+        except Exception:
+            # Retry with legacy (non-zip) serialization
+            torch.save(checkpoint, tmp_path, _use_new_zipfile_serialization=False)
+        os.replace(tmp_path, path)
+        print(f"Model saved to {path}")
+    except Exception as e:
+        # Don't crash training if saving fails; surface a clear message.
+        print(f"[save_model] Warning: failed to save checkpoint to {path}: {e}")
+        print("[save_model] Tips: check free disk space, antivirus/file-sync locks (OneDrive/Defender), and write permissions.")
 
 
 def load_model(path: str, device: torch.device, vae_model_path_override: Optional[str] = None,

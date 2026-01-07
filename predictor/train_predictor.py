@@ -71,6 +71,14 @@ def main():
                        help='NPZ files for training')
     parser.add_argument('--sequence_length', type=int, default=16,
                        help='Sequence length')
+    parser.add_argument('--input_length', type=int, default=15,
+                       help='Number of context frames used as input (default: 15)')
+    parser.add_argument('--target_length', type=int, default=15,
+                       help='Number of target/future frames to predict (default: 15)')
+    parser.add_argument('--target_offset', type=int, default=1,
+                       help=("Start index of target frames within the sampled window. "
+                             "Default 1 (teacher-forcing next-step). For non-overlap future chunk, "
+                             "use target_offset==input_length and sequence_length>=input_length+target_length."))
     parser.add_argument('--sequence_length_curriculum', action='store_true',
                        help='Enable curriculum schedule for sequence_length (rebuild dataset/dataloader at stage boundaries)')
     parser.add_argument('--sequence_length_schedule', type=str, default='0:32,20:64',
@@ -153,6 +161,13 @@ def main():
                        help='Use automatic mixed precision')
     parser.add_argument('--amp_disable_open_loop_threshold', type=int, default=30,
                        help='If open_loop_steps >= this, disable AMP for stability (default: 30)')
+
+    # Uncertainty / sampling
+    # Default: enabled (safer; avoids turning the VAE posterior into a deterministic encoder).
+    parser.add_argument('--latent_sampling', dest='latent_sampling', action='store_true', default=True,
+                       help='Sample z via reparameterization (mu,logvar) instead of using mu only (default: enabled).')
+    parser.add_argument('--no_latent_sampling', dest='latent_sampling', action='store_false',
+                       help='Disable latent sampling and use mu only (deterministic).')
     
     args = parser.parse_args()
     
@@ -188,7 +203,10 @@ def main():
             npz_paths=npz_paths,
             sequence_length=int(seq_len),
             image_size=image_size,
-            normalize=True
+            normalize=True,
+            input_length=int(args.input_length),
+            target_length=int(args.target_length),
+            target_offset=int(args.target_offset),
         )
 
         total_size = len(dataset_local)
@@ -367,7 +385,8 @@ def main():
                 target_jitter_scale=0.0,  # No jitter
                 detach_target=True,  # Always detach when frozen
                 open_loop_steps=current_open_loop_steps,  # Enable open-loop rollout (curriculum)
-                open_loop_weight=args.open_loop_weight
+                open_loop_weight=args.open_loop_weight,
+                latent_sampling=bool(args.latent_sampling),
             )
         else:
             # Default encoder: use full VAE loss with all options
@@ -380,7 +399,8 @@ def main():
                 target_jitter_scale=args.target_jitter,
                 detach_target=args.detach_target,
                 open_loop_steps=current_open_loop_steps,
-                open_loop_weight=args.open_loop_weight
+                open_loop_weight=args.open_loop_weight,
+                latent_sampling=bool(args.latent_sampling),
             )
         
         # Store metrics

@@ -15,6 +15,8 @@ import argparse
 from torch.utils.data import DataLoader
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
+import csv
+import json
 
 try:
     import imageio
@@ -31,6 +33,57 @@ except ImportError:
     HAS_PIL = False
 
 from vae_predictor import VAEPredictor, TrajectoryDataset, load_model
+
+
+def _to_01(x: torch.Tensor) -> torch.Tensor:
+    """Convert model outputs to [0,1] range if they look like tanh outputs."""
+    if x.min() < 0:
+        x = (x + 1.0) / 2.0
+    return torch.clamp(x, 0.0, 1.0)
+
+
+def _psnr_from_mse(mse: float, data_range: float = 1.0, eps: float = 1e-12) -> float:
+    mse = float(max(mse, eps))
+    return float(10.0 * np.log10((data_range ** 2) / mse))
+
+
+def _gaussian_window(window_size: int = 11, sigma: float = 1.5, device=None, dtype=None) -> torch.Tensor:
+    coords = torch.arange(window_size, device=device, dtype=dtype) - (window_size - 1) / 2.0
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    g = g / g.sum()
+    w = (g[:, None] * g[None, :]).unsqueeze(0).unsqueeze(0)  # (1,1,ws,ws)
+    return w
+
+
+def _ssim(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0, window_size: int = 11, sigma: float = 1.5) -> float:
+    """SSIM over batch, computed on grayscale for speed. Expects img in [0,1], shape (B,3,H,W)."""
+    img1 = _to_01(img1)
+    img2 = _to_01(img2)
+    # grayscale
+    if img1.size(1) == 3:
+        w_rgb = img1.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+        img1g = (img1 * w_rgb).sum(dim=1, keepdim=True)
+        img2g = (img2 * w_rgb).sum(dim=1, keepdim=True)
+    else:
+        img1g = img1
+        img2g = img2
+
+    window = _gaussian_window(window_size, sigma, device=img1.device, dtype=img1.dtype)
+    pad = window_size // 2
+    mu1 = F.conv2d(img1g, window, padding=pad)
+    mu2 = F.conv2d(img2g, window, padding=pad)
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu12 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1g * img1g, window, padding=pad) - mu1_sq
+    sigma2_sq = F.conv2d(img2g * img2g, window, padding=pad) - mu2_sq
+    sigma12 = F.conv2d(img1g * img2g, window, padding=pad) - mu12
+
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    ssim_map = ((2 * mu12 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-12)
+    return float(ssim_map.mean().item())
 
 
 def _overlay_sbs_labels(frame_u8: np.ndarray, left_label: str = "GT", right_label: str = "PR") -> np.ndarray:
@@ -97,11 +150,19 @@ def compute_baseline_vs_lstm(model: VAEPredictor, dataloader: DataLoader, device
             input_frames = batch['input_frames'].to(device)  # (B, 15, 3, 64, 64)
             target_frames = batch['target_frames'].to(device)  # (B, 15, 3, 64, 64)
             B, T = input_frames.shape[:2]
+            target_offset = int(batch.get('target_offset', torch.tensor(1))[0].item()) if isinstance(batch.get('target_offset', 1), torch.Tensor) else int(batch.get('target_offset', 1))
+            if target_offset != 1 or target_frames.shape[1] != T:
+                # This check is specifically designed for next-step teacher forcing alignment.
+                if batch_idx == 0:
+                    print(f"[Skip Check1] baseline-vs-lstm assumes target_offset=1 and target_length==input_length. "
+                          f"Got target_offset={target_offset}, input_length={T}, target_length={target_frames.shape[1]}.")
+                continue
             
             # Get actions if available
             actions_seq = None
             if 'actions' in batch and model.action_dim > 0:
-                actions_seq = batch['actions'][:, :-1, :].to(device)  # (B, 15, action_dim)
+                actions_full = batch['actions'].to(device)
+                actions_seq = actions_full[:, 0:T, :]  # align with input sequence length
             
             # Encode input sequence (use mu directly, no sampling)
             in_flat = input_frames.reshape(B*T, *input_frames.shape[2:])
@@ -200,7 +261,11 @@ def compute_baseline_vs_lstm(model: VAEPredictor, dataloader: DataLoader, device
 
 
 def compute_multi_step_rollout(model: VAEPredictor, dataloader: DataLoader, device: torch.device,
-                               max_horizon: int = 15, max_batches: int = None) -> Dict:
+                               max_horizon: int = 15, max_batches: int = None,
+                               psnr_threshold: float = 20.0, ssim_threshold: float = 0.5,
+                               mc_samples: int = 1,
+                               gt_from_npz: bool = False,
+                               mse_threshold: float = 0.01) -> Dict:
     """Check 2: Multi-step open-loop rollout"""
     print("\n" + "="*70)
     print("Check 2: Multi-step Open-loop Rollout")
@@ -214,7 +279,18 @@ def compute_multi_step_rollout(model: VAEPredictor, dataloader: DataLoader, devi
         print(f"Evaluating {total_batches} batches")
     
     model.eval()
-    horizon_mses = {h: [] for h in range(1, max_horizon + 1)}
+
+    methods = ["lstm", "identity", "linear"]
+
+    def _init_hdict():
+        return {h: [] for h in range(1, max_horizon + 1)}
+
+    horizon_latent_mse = {m: _init_hdict() for m in methods}
+    horizon_img_mse = {m: _init_hdict() for m in methods}
+    horizon_psnr = {m: _init_hdict() for m in methods}
+    horizon_ssim = {m: _init_hdict() for m in methods}
+    # Only meaningful for the learned model
+    horizon_latent_std = _init_hdict()
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -222,88 +298,289 @@ def compute_multi_step_rollout(model: VAEPredictor, dataloader: DataLoader, devi
                 break
             input_frames = batch['input_frames'].to(device)  # (B, 15, 3, 64, 64)
             target_frames = batch['target_frames'].to(device)  # (B, 15, 3, 64, 64)
-            B, T = input_frames.shape[:2]
+            B = input_frames.shape[0]
+            T_in = input_frames.shape[1]
+            T = target_frames.shape[1]
+            target_offset = int(batch.get('target_offset', torch.tensor(1))[0].item()) if isinstance(batch.get('target_offset', 1), torch.Tensor) else int(batch.get('target_offset', 1))
+            start_idx = target_offset - 1
+            if start_idx < 0 or start_idx >= T_in:
+                raise ValueError(f"Bad alignment: need 0 <= target_offset-1 < input_length. "
+                                 f"Got target_offset={target_offset}, input_length={T_in}.")
             
             # Get actions if available
             actions_seq = None
             if 'actions' in batch and model.action_dim > 0:
-                actions_seq = batch['actions'][:, :-1, :].to(device)  # (B, 15, action_dim)
+                actions_full = batch['actions'].to(device)  # (B, L, action_dim)
+                actions_seq = actions_full  # keep full window; we'll index with start_idx + step - 1
+
+            # Optionally pull GT (and actions) directly from the underlying NPZ memmap,
+            # so we can evaluate horizons beyond the sampled window even if sequence_length is small.
+            gt_frames_full = None  # (B, K, 3, H, W) float32 in [0,1]
+            gt_actions_full = None  # (B, K, A) normalized like dataset, aligned to transitions (step k uses index k-1)
+            gt_steps_avail = 0
+            if gt_from_npz:
+                if not hasattr(dataloader, "dataset") or not hasattr(dataloader.dataset, "_locate"):
+                    raise ValueError("gt_from_npz requires dataloader.dataset to be TrajectoryDataset")
+                if "global_idx" not in batch:
+                    raise ValueError("gt_from_npz requires TrajectoryDataset to return 'global_idx'")
+                ds = dataloader.dataset
+                idxs = batch["global_idx"].tolist()
+                gt_list = []
+                act_list = []
+                for gi in idxs:
+                    file_idx, local_start = ds._locate(int(gi))
+                    f = ds.files[file_idx]
+                    s0 = int(local_start)
+                    # We start rollout from frame (s0 + start_idx). Step 1 compares to frame (s0 + start_idx + 1).
+                    frames = f["frames"]  # (T,3,H,W) uint8
+                    actions = f["actions"]  # (T,A) float32
+                    max_take = int(max_horizon)
+                    # How many future GT frames can we fetch within this file?
+                    # We compare step 1..K to frames (s0+start_idx+1 .. s0+start_idx+K)
+                    avail_future = int(frames.shape[0] - (s0 + start_idx + 1))
+                    take = max(0, min(max_take, avail_future))
+                    # Fetch frames for steps 1..take: indices (s0+start_idx+1) .. (s0+start_idx+take)
+                    if take > 0:
+                        gt_u8 = frames[(s0 + start_idx + 1):(s0 + start_idx + 1 + take)]
+                        gt_f = torch.from_numpy(gt_u8.astype(np.float32)) / 255.0
+                    else:
+                        gt_f = torch.zeros((0, *frames.shape[1:]), dtype=torch.float32)
+                    gt_list.append(gt_f)
+
+                    if model.action_dim > 0:
+                        # Actions aligned to transitions: for step k (1-based), use action at index (s0+start_idx+k-1)
+                        if take > 0:
+                            raw_a = actions[(s0 + start_idx):(s0 + start_idx + take)]  # (take, A)
+                            a = torch.from_numpy(raw_a.astype(np.float32))
+                            mean = torch.from_numpy(ds.act_mean.astype(np.float32))
+                            std = torch.from_numpy(ds.act_std.astype(np.float32))
+                            a = (a - mean) / std
+                            a = torch.clamp(a, -3.0, 3.0) / 3.0
+                        else:
+                            a = torch.zeros((0, int(actions.shape[1])), dtype=torch.float32)
+                        act_list.append(a)
+
+                gt_steps_avail = min([g.shape[0] for g in gt_list]) if gt_list else 0
+                if gt_steps_avail > 0:
+                    gt_frames_full = torch.stack([g[:gt_steps_avail] for g in gt_list], dim=0).to(device)  # (B,K,3,H,W)
+                    if model.action_dim > 0:
+                        gt_actions_full = torch.stack([a[:gt_steps_avail] for a in act_list], dim=0).to(device)  # (B,K,A)
+                else:
+                    gt_frames_full = None
+                    gt_actions_full = None
             
             # Encode first frame for rollout start
-            first_frame = input_frames[:, 0, ...]  # (B, 3, 64, 64)
+            first_frame = input_frames[:, start_idx, ...]  # (B, 3, 64, 64)
             mu_start, _ = model.encode(first_frame)
             
-            # Encode target frames for comparison
-            target_flat = target_frames.reshape(B*T, *target_frames.shape[2:])
-            mu_target, _ = model.encode(target_flat)
+            # Encode target frames for comparison (either from window, or from NPZ future frames)
+            if gt_frames_full is not None:
+                T_cmp = int(gt_steps_avail)
+                gt_flat = gt_frames_full.reshape(B*T_cmp, *gt_frames_full.shape[2:])
+                mu_target, _ = model.encode(gt_flat)
+            else:
+                T_cmp = int(T)
+                target_flat = target_frames.reshape(B*T_cmp, *target_frames.shape[2:])
+                mu_target, _ = model.encode(target_flat)
             
             if model.vae_encoder is not None:
                 z_start = mu_start  # (B, C, 4, 4)
-                z_target = mu_target.reshape(B, T, *mu_target.shape[1:])  # (B, T, C, 4, 4)
+                z_target = mu_target.reshape(B, T_cmp, *mu_target.shape[1:])  # (B, T, C, 4, 4)
             else:
                 z_start = mu_start  # (B, D)
-                z_target = mu_target.reshape(B, T, -1)  # (B, T, D)
+                z_target = mu_target.reshape(B, T_cmp, -1)  # (B, T, D)
             
-            # Rollout: start from z_start, predict step by step
-            z_current = z_start  # (B, C, 4, 4) or (B, D)
+            # Rollout states for each method
+            z_cur_lstm = z_start
+            z_cur_id = z_start
+            z_cur_lin = z_start
+            # z_{t-1} for linear extrap. If we don't have a previous observed frame (start_idx==0),
+            # linear extrap degenerates to identity (and will overlap).
+            if start_idx > 0:
+                prev_frame = input_frames[:, start_idx - 1, ...]
+                mu_prev, _ = model.encode(prev_frame)
+                z_prev_lin = mu_prev
+            else:
+                z_prev_lin = z_start
             
             for step in range(1, max_horizon + 1):
-                # Prepare input for single step prediction
-                if model.vae_encoder is not None:
-                    z_current_expanded = z_current.unsqueeze(1)  # (B, 1, C, 4, 4)
-                else:
-                    z_current_expanded = z_current.unsqueeze(1)  # (B, 1, D)
+                # Prepare input for learned model single-step prediction
+                z_current_expanded = z_cur_lstm.unsqueeze(1)
                 
                 # Get action for this step if available
                 a_step = None
-                if actions_seq is not None:
-                    # Use last available action if step exceeds sequence length
-                    action_idx = min(step - 1, actions_seq.shape[1] - 1)
+                if gt_actions_full is not None:
+                    # Use the real future actions aligned to GT-from-NPZ horizons.
+                    # step is 1-based, so use index step-1.
+                    if gt_actions_full.size(1) >= step:
+                        a_step = gt_actions_full[:, (step - 1):(step - 1) + 1, :]
+                    else:
+                        # If we ran out of actions (near end-of-file), repeat the last available one.
+                        a_step = gt_actions_full[:, -1:, :]
+                elif actions_seq is not None:
+                    # Fallback: use window actions; for horizons beyond window we repeat last action.
+                    action_idx = min(start_idx + step - 1, actions_seq.shape[1] - 1)
                     a_step = actions_seq[:, action_idx:action_idx+1, :]  # (B, 1, action_dim)
                 
-                # Predict next latent
-                z_next = model.predict(z_current_expanded, a_step)  # (B, 1, C, 4, 4) or (B, 1, D)
-                z_next = z_next.squeeze(1)  # (B, C, 4, 4) or (B, D)
+                # Predict next latent (optionally MC dropout for epistemic uncertainty)
+                if int(mc_samples) > 1 and hasattr(model, "predict_mc"):
+                    mc = model.predict_mc(z_current_expanded, a_step, mc_samples=int(mc_samples), enable_dropout=True)
+                    z_next = mc["mean"].squeeze(1)
+                    z_std = mc["std"].squeeze(1)
+                else:
+                    z_next = model.predict(z_current_expanded, a_step).squeeze(1)
+                    z_std = None
+
+                # Baselines:
+                # 1) Identity: z_{t+1} = z_t
+                z_next_id = z_cur_id
+                # 2) Linear extrapolation: z_{t+1} = z_t + (z_t - z_{t-1})
+                # For step==1, fall back to identity (no z_{t-1}).
+                if step == 1:
+                    z_next_lin = z_cur_lin
+                else:
+                    z_next_lin = z_cur_lin + (z_cur_lin - z_prev_lin)
                 
                 # Compare with target only if we have target frames (step <= T)
-                if step <= T:
+                if step <= T_cmp:
                     z_target_step = z_target[:, step-1, ...]  # (B, C, 4, 4) or (B, D)
                     
-                    # Compute MSE
-                    if model.vae_encoder is not None:
-                        z_next_flat = z_next.reshape(B, -1)
-                        z_target_step_flat = z_target_step.reshape(B, -1)
-                    else:
-                        z_next_flat = z_next
-                        z_target_step_flat = z_target_step
-                    
-                    mse = F.mse_loss(z_next_flat, z_target_step_flat, reduction='mean').item()
-                    horizon_mses[step].append(mse)
+                    def _latent_mse(zp: torch.Tensor) -> float:
+                        if model.vae_encoder is not None:
+                            return F.mse_loss(zp.reshape(B, -1), z_target_step.reshape(B, -1), reduction="mean").item()
+                        return F.mse_loss(zp, z_target_step, reduction="mean").item()
+
+                    horizon_latent_mse["lstm"][step].append(_latent_mse(z_next))
+                    horizon_latent_mse["identity"][step].append(_latent_mse(z_next_id))
+                    horizon_latent_mse["linear"][step].append(_latent_mse(z_next_lin))
+
+                    if z_std is not None:
+                        # summarize latent std magnitude for this horizon
+                        if model.vae_encoder is not None:
+                            s = z_std.reshape(B, -1).mean(dim=1).mean().item()
+                        else:
+                            s = z_std.mean(dim=1).mean().item()
+                        horizon_latent_std[step].append(float(s))
+
+                    # Image-space metrics (decode without skip features to avoid leakage)
+                    try:
+                        gt_img = _to_01(gt_frames_full[:, step-1, ...]) if gt_frames_full is not None else _to_01(target_frames[:, step-1, ...])
+
+                        pred_img = _to_01(model.decode_images(z_next))
+                        im_mse = F.mse_loss(pred_img, gt_img, reduction='mean').item()
+                        horizon_img_mse["lstm"][step].append(im_mse)
+                        horizon_psnr["lstm"][step].append(_psnr_from_mse(im_mse))
+                        horizon_ssim["lstm"][step].append(_ssim(pred_img, gt_img))
+
+                        pred_img_id = _to_01(model.decode_images(z_next_id))
+                        im_mse_id = F.mse_loss(pred_img_id, gt_img, reduction='mean').item()
+                        horizon_img_mse["identity"][step].append(im_mse_id)
+                        horizon_psnr["identity"][step].append(_psnr_from_mse(im_mse_id))
+                        horizon_ssim["identity"][step].append(_ssim(pred_img_id, gt_img))
+
+                        pred_img_lin = _to_01(model.decode_images(z_next_lin))
+                        im_mse_lin = F.mse_loss(pred_img_lin, gt_img, reduction='mean').item()
+                        horizon_img_mse["linear"][step].append(im_mse_lin)
+                        horizon_psnr["linear"][step].append(_psnr_from_mse(im_mse_lin))
+                        horizon_ssim["linear"][step].append(_ssim(pred_img_lin, gt_img))
+                    except Exception:
+                        # If decoder is unavailable or decode fails, skip image metrics.
+                        pass
                 
-                # Use predicted latent for next step (open-loop)
-                z_current = z_next
+                # Advance rollouts
+                z_cur_lstm = z_next
+                z_cur_id = z_next_id
+                z_prev_lin = z_cur_lin
+                z_cur_lin = z_next_lin
             
             if batch_idx % 10 == 0 or (batch_idx + 1) == total_batches:
                 progress = (batch_idx + 1) / total_batches * 100
                 print(f"Batch {batch_idx+1}/{total_batches} ({progress:.1f}%): Rollout completed")
     
-    # Compute average MSE for each horizon (only where GT exists)
-    avg_mses = {}
-    for h in range(1, max_horizon + 1):
-        if horizon_mses[h]:
-            avg_mses[h] = float(np.mean(horizon_mses[h]))
-        else:
-            avg_mses[h] = None
+    def _avg_curve(hdict):
+        out = {}
+        for h in range(1, max_horizon + 1):
+            out[h] = float(np.mean(hdict[h])) if hdict[h] else None
+        return out
+
+    curves = {}
+    for m in methods:
+        curves[m] = {
+            "latent_mse": _avg_curve(horizon_latent_mse[m]),
+            "img_mse": _avg_curve(horizon_img_mse[m]),
+            "psnr": _avg_curve(horizon_psnr[m]),
+            "ssim": _avg_curve(horizon_ssim[m]),
+        }
+
+    avg_latent_std = _avg_curve(horizon_latent_std)
+
+    # If linear is identical to identity (common when target_offset==1 so there's no previous frame),
+    # warn the user so they don't think it's missing.
+    try:
+        diffs = []
+        for h in range(1, max_horizon + 1):
+            a = curves["identity"]["latent_mse"].get(h, None)
+            b = curves["linear"]["latent_mse"].get(h, None)
+            if a is None or b is None:
+                continue
+            diffs.append(abs(float(a) - float(b)))
+        if diffs and max(diffs) < 1e-12:
+            print("\nNote: 'linear' baseline overlaps 'identity' here (degenerate case).")
+            print("  Reason: linear extrap needs two past frames; with target_offset=1 the rollout starts at frame 0, so we can't estimate velocity.")
+            print("  Fix: use a start index > 0 (e.g., set target_offset=2 and target_length=14 with sequence_length=16), or evaluate a later start point.")
+    except Exception:
+        pass
     
-    print(f"\nResults (MSE vs horizon):")
-    for h in sorted(avg_mses.keys()):
-        v = avg_mses[h]
-        if v is None:
-            print(f"  Horizon {h:2d}: N/A (no GT beyond sequence_length={T})")
-        else:
-            print(f"  Horizon {h:2d}: {v:.6f}")
-    
-    return avg_mses
+    for m in methods:
+        print(f"\nResults ({m}): latent MSE vs horizon")
+        for h in range(1, max_horizon + 1):
+            v = curves[m]["latent_mse"][h]
+            if v is not None:
+                print(f"  Horizon {h:2d}: {v:.6f}")
+
+        if any(v is not None for v in curves[m]["img_mse"].values()):
+            print(f"\nImage-space metrics ({m}):")
+            for h in range(1, max_horizon + 1):
+                im = curves[m]["img_mse"][h]
+                if im is None:
+                    continue
+                print(f"  Horizon {h:2d}: img_mse={im:.6f}  psnr={curves[m]['psnr'][h]:.2f}  ssim={curves[m]['ssim'][h]:.3f}")
+
+            # Effective horizon by thresholds
+            eff_psnr = 0
+            eff_ssim = 0
+            eff_mse = 0
+            for h in range(1, max_horizon + 1):
+                ps = curves[m]["psnr"][h]
+                ss = curves[m]["ssim"][h]
+                im = curves[m]["img_mse"][h]
+                if ps is not None and ps >= float(psnr_threshold):
+                    eff_psnr = h
+                if ss is not None and ss >= float(ssim_threshold):
+                    eff_ssim = h
+                if im is not None and im <= float(mse_threshold):
+                    eff_mse = h
+            print(f"\nEffective horizon ({m}): PSNR≥{psnr_threshold} => {eff_psnr} steps; "
+                  f"SSIM≥{ssim_threshold} => {eff_ssim} steps; "
+                  f"imgMSE≤{mse_threshold} => {eff_mse} steps")
+
+    if any(v is not None for v in avg_latent_std.values()):
+        print("\nUncertainty (MC-dropout latent std, mean over dims+batch) [lstm only]:")
+        for h in range(1, max_horizon + 1):
+            if avg_latent_std[h] is None:
+                continue
+            print(f"  Horizon {h:2d}: latent_std={avg_latent_std[h]:.6f}")
+
+    return {
+        # Back-compat: keep top-level keys as the learned model
+        "latent_mse": curves["lstm"]["latent_mse"],
+        "img_mse": curves["lstm"]["img_mse"],
+        "psnr": curves["lstm"]["psnr"],
+        "ssim": curves["lstm"]["ssim"],
+        # New: all methods
+        "curves": curves,
+        "latent_std_mc": avg_latent_std,
+    }
 
 
 def visualize_predictions(model: VAEPredictor, dataloader: DataLoader, device: torch.device,
@@ -321,11 +598,18 @@ def visualize_predictions(model: VAEPredictor, dataloader: DataLoader, device: t
         input_frames = batch['input_frames'].to(device)  # (B, 15, 3, 64, 64)
         target_frames = batch['target_frames'].to(device)  # (B, 15, 3, 64, 64)
         B = input_frames.shape[0]
+        T_in = input_frames.shape[1]
+        target_offset = int(batch.get('target_offset', torch.tensor(1))[0].item()) if isinstance(batch.get('target_offset', 1), torch.Tensor) else int(batch.get('target_offset', 1))
+        start_idx = target_offset - 1
+        if start_idx < 0 or start_idx >= T_in:
+            raise ValueError(f"Bad alignment: need 0 <= target_offset-1 < input_length. "
+                             f"Got target_offset={target_offset}, input_length={T_in}.")
         
         # Get actions if available
         actions_seq = None
         if 'actions' in batch and model.action_dim > 0:
-            actions_seq = batch['actions'][:, :-1, :].to(device)  # (B, 15, action_dim)
+            actions_full = batch['actions'].to(device)
+            actions_seq = actions_full[:, 0:T_in, :]  # align with rollout start
         
         num_samples = min(num_samples, B)
         
@@ -342,7 +626,7 @@ def visualize_predictions(model: VAEPredictor, dataloader: DataLoader, device: t
                 a_seq = actions_seq[sample_idx:sample_idx+1]  # (1, 15, action_dim)
             
             # Encode first frame
-            first_frame = input_seq[:, 0, ...]  # (1, 3, 64, 64)
+            first_frame = input_seq[:, start_idx, ...]  # (1, 3, 64, 64)
             mu_start, _ = model.encode(first_frame)
             z_start = mu_start  # (1, C, 4, 4) or (1, D)
             
@@ -377,8 +661,8 @@ def visualize_predictions(model: VAEPredictor, dataloader: DataLoader, device: t
                 # Get action if available
                 a_step = None
                 if a_seq is not None and a_seq.shape[1] > 0:
-                    # Use last available action if step exceeds sequence length
-                    action_idx = min(step, a_seq.shape[1] - 1)
+                    # Use action aligned to transition (start_idx + step) -> (start_idx + step + 1)
+                    action_idx = min(start_idx + step, a_seq.shape[1] - 1)
                     a_step = a_seq[:, action_idx:action_idx+1, :]  # (1, 1, action_dim)
                 
                 # Predict
@@ -504,8 +788,11 @@ def visualize_rollout_images(model: VAEPredictor, dataset: TrajectoryDataset, de
     input_frames = sample['input_frames'].unsqueeze(0).to(device)  # (1, 15, 3, 64, 64)
     target_frames = sample['target_frames'].unsqueeze(0).to(device)  # (1, 15, 3, 64, 64)
     actions = sample.get('actions', None)
-    if actions is not None:
+    # Only use actions if the predictor was trained/configured with action_dim > 0.
+    if actions is not None and getattr(model, "action_dim", 0) > 0:
         actions = actions.unsqueeze(0).to(device)  # (1, 15, action_dim)
+    else:
+        actions = None
     
     # Combine input and target frames for full sequence
     all_frames = torch.cat([input_frames, target_frames], dim=1)  # (1, 30, 3, 64, 64)
@@ -641,8 +928,10 @@ def generate_prediction_video(model: VAEPredictor, dataset: TrajectoryDataset, d
     input_frames = sample['input_frames'].unsqueeze(0).to(device)  # (1, 15, 3, 64, 64)
     target_frames = sample['target_frames'].unsqueeze(0).to(device)  # (1, 15, 3, 64, 64)
     actions = sample.get('actions', None)
-    if actions is not None:
+    if actions is not None and getattr(model, "action_dim", 0) > 0:
         actions = actions.unsqueeze(0).to(device)  # (1, 16, action_dim) (dataset returns length=sequence_length)
+    else:
+        actions = None
 
     # Optionally fetch a longer continuous action sequence directly from the underlying NPZ (memmap),
     # instead of repeating the last action when t exceeds dataset sequence length.
@@ -834,10 +1123,27 @@ def main():
                        help='NPZ files for evaluation')
     parser.add_argument('--sequence_length', type=int, default=16,
                        help='Sequence length')
+    parser.add_argument('--input_length', type=int, default=15,
+                       help='Number of context frames (input) in each sample')
+    parser.add_argument('--target_length', type=int, default=15,
+                       help='Number of target frames (GT) in each sample')
+    parser.add_argument('--target_offset', type=int, default=1,
+                       help='Start index of target frames within sampled window (default: 1)')
     parser.add_argument('--batch_size', type=int, default=4,
                        help='Batch size for evaluation')
     parser.add_argument('--max_horizon', type=int, default=30,
                        help='Maximum horizon for multi-step rollout')
+    parser.add_argument('--psnr_threshold', type=float, default=20.0,
+                       help='PSNR threshold for effective horizon (image-space)')
+    parser.add_argument('--ssim_threshold', type=float, default=0.5,
+                       help='SSIM threshold for effective horizon (image-space)')
+    parser.add_argument('--mse_threshold', type=float, default=0.01,
+                       help='Image MSE threshold for effective horizon (image-space).')
+    parser.add_argument('--mc_samples', type=int, default=1,
+                       help='MC-dropout samples for uncertainty (1 disables; >1 enables).')
+    parser.add_argument('--gt_from_npz', action='store_true',
+                       help='If set: use future frames from the same NPZ (memmap) as GT for rollout metrics, '
+                            'even when sequence_length is small.')
     parser.add_argument('--num_vis_samples', type=int, default=3,
                        help='Number of samples to visualize')
     parser.add_argument('--max_eval_batches', type=int, default=None,
@@ -882,7 +1188,14 @@ def main():
     # Create dataset
     npz_paths = [os.path.join(args.data_dir, f) for f in args.npz_files]
     print(f"\nLoading data from: {npz_paths}")
-    dataset = TrajectoryDataset(npz_paths=npz_paths, sequence_length=args.sequence_length, normalize=True)
+    dataset = TrajectoryDataset(
+        npz_paths=npz_paths,
+        sequence_length=args.sequence_length,
+        normalize=True,
+        input_length=int(args.input_length),
+        target_length=int(args.target_length),
+        target_offset=int(args.target_offset),
+    )
     
     dataloader = DataLoader(
         dataset,
@@ -904,7 +1217,12 @@ def main():
     # Check 2: Multi-step rollout
     rollout_results = compute_multi_step_rollout(model, dataloader, device, 
                                                   max_horizon=args.max_horizon,
-                                                  max_batches=args.max_eval_batches)
+                                                  max_batches=args.max_eval_batches,
+                                                  psnr_threshold=float(args.psnr_threshold),
+                                                  ssim_threshold=float(args.ssim_threshold),
+                                                  mc_samples=int(args.mc_samples),
+                                                  gt_from_npz=bool(args.gt_from_npz),
+                                                  mse_threshold=float(args.mse_threshold))
     
     # Check 3: Visualization
     visualize_predictions(model, dataloader, device, 
@@ -926,16 +1244,31 @@ def main():
     print("Plotting Rollout MSE vs Horizon")
     print("="*70)
     
-    # Only plot horizons where we actually have GT (value is not None)
-    horizons = sorted([h for h, v in rollout_results.items() if v is not None])
-    mses = [rollout_results[h] for h in horizons]
-    
+    curves = rollout_results.get("curves", {})
     plt.figure(figsize=(10, 6))
-    plt.plot(horizons, mses, 'o-', linewidth=2, markersize=8)
+    # Plot order + style to avoid "identity" being hidden when it overlaps "linear".
+    # If linear degenerates to identity, they can overlap perfectly; draw linear AFTER identity so it's visible.
+    plot_order = ["identity", "linear", "lstm"]
+    style = {
+        "lstm": dict(linestyle="-", marker="o", linewidth=2, markersize=5, zorder=3),
+        "identity": dict(linestyle="--", marker="o", linewidth=2, markersize=4, alpha=0.7, zorder=1),
+        "linear": dict(linestyle=":", marker="o", linewidth=2, markersize=4, zorder=2),
+    }
+    for name in plot_order:
+        if name not in curves:
+            continue
+        c = curves[name]
+        latent_curve = c.get("latent_mse", {})
+        horizons = sorted([h for h, v in latent_curve.items() if v is not None])
+        mses = [latent_curve[h] for h in horizons]
+        if horizons:
+            plt.plot(horizons, mses, label=name, **style.get(name, {}))
     plt.xlabel('Horizon (steps)', fontsize=12)
     plt.ylabel('MSE', fontsize=12)
-    plt.title('Multi-step Open-loop Rollout: MSE vs Horizon', fontsize=14)
+    plt.title('Multi-step Open-loop Rollout (Latent): MSE vs Horizon', fontsize=14)
     plt.grid(True, alpha=0.3)
+    if curves:
+        plt.legend()
     plt.tight_layout()
     
     plot_path = os.path.join(args.save_dir, 'rollout_mse_vs_horizon.png')
@@ -948,12 +1281,88 @@ def main():
         'baseline': baseline_results,
         'rollout': rollout_results
     }
-    
-    import json
+
+    # ---- Structured exports (JSON + CSV) for papers/reports ----
+    def _effective_horizon_from_curve(curve: Dict[int, float], predicate) -> int:
+        """Largest horizon h such that predicate(curve[h]) is True. curve values may be None."""
+        best = 0
+        for h in sorted(curve.keys()):
+            v = curve[h]
+            if v is None:
+                continue
+            try:
+                if predicate(float(v)):
+                    best = int(h)
+            except Exception:
+                continue
+        return best
+
+    curves = rollout_results.get("curves", {})
+    thresholds = {
+        "psnr_threshold": float(args.psnr_threshold),
+        "ssim_threshold": float(args.ssim_threshold),
+        "mse_threshold": float(args.mse_threshold),
+    }
+    effective = {}
+    for name, c in curves.items():
+        effective[name] = {
+            "psnr": _effective_horizon_from_curve(c.get("psnr", {}), lambda x: x >= thresholds["psnr_threshold"]),
+            "ssim": _effective_horizon_from_curve(c.get("ssim", {}), lambda x: x >= thresholds["ssim_threshold"]),
+            "img_mse": _effective_horizon_from_curve(c.get("img_mse", {}), lambda x: x <= thresholds["mse_threshold"]),
+        }
+
+    export = {
+        "args": vars(args),
+        "thresholds": thresholds,
+        "effective_horizon": effective,
+        "baseline": baseline_results,
+        "rollout": rollout_results,
+    }
+
     results_path = os.path.join(args.save_dir, 'eval_results.json')
-    with open(results_path, 'w') as f:
+    with open(results_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved results to {results_path}")
+
+    export_path = os.path.join(args.save_dir, "rollout_metrics.json")
+    with open(export_path, "w", encoding="utf-8") as f:
+        json.dump(export, f, indent=2)
+    print(f"Saved rollout metrics to {export_path}")
+
+    # Curves CSVs: horizon,lstm,identity,linear for each metric
+    def _write_curve_csv(metric_key: str, out_name: str):
+        if not curves:
+            return
+        all_h = set()
+        for c in curves.values():
+            all_h.update([int(h) for h in c.get(metric_key, {}).keys()])
+        horizons = sorted(all_h)
+        out_path = os.path.join(args.save_dir, out_name)
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["horizon", "lstm", "identity", "linear"])
+            for h in horizons:
+                row = [h]
+                for name in ["lstm", "identity", "linear"]:
+                    v = curves.get(name, {}).get(metric_key, {}).get(h, None)
+                    row.append("" if v is None else float(v))
+                w.writerow(row)
+        print(f"Saved CSV: {out_path}")
+
+    _write_curve_csv("latent_mse", "rollout_latent_mse.csv")
+    _write_curve_csv("img_mse", "rollout_img_mse.csv")
+    _write_curve_csv("psnr", "rollout_psnr.csv")
+    _write_curve_csv("ssim", "rollout_ssim.csv")
+
+    # Effective horizon CSV
+    eff_path = os.path.join(args.save_dir, "effective_horizon.csv")
+    with open(eff_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["method", "psnr>=thr", "ssim>=thr", "img_mse<=thr"])
+        for name in ["lstm", "identity", "linear"]:
+            e = effective.get(name, {})
+            w.writerow([name, e.get("psnr", ""), e.get("ssim", ""), e.get("img_mse", "")])
+    print(f"Saved CSV: {eff_path}")
     
     # Generate prediction video if requested
     if args.generate_video:
