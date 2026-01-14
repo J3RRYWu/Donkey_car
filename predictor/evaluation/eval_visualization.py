@@ -15,8 +15,8 @@ try:
 except ImportError:
     HAS_IMAGEIO = False
 
-from vae_predictor import VAEPredictor, TrajectoryDataset
-from eval_utils import overlay_sbs_labels
+from predictor.core.vae_predictor import VAEPredictor, TrajectoryDataset
+from predictor.evaluation.eval_utils import overlay_sbs_labels
 
 
 def visualize_predictions(model: VAEPredictor, dataloader: DataLoader, device: torch.device,

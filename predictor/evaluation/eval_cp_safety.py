@@ -19,7 +19,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import json
 
-from conformal import CPQuantiles, nonconformity_scores, conformal_quantile
+from predictor.conformal.conformal import CPQuantiles, nonconformity_scores, conformal_quantile
 
 
 @dataclass

@@ -11,9 +11,9 @@ from typing import Tuple
 from matplotlib import patches
 import matplotlib.pyplot as plt
 
-from vae_predictor import VAEPredictor, TrajectoryDataset
-from conformal import CPQuantiles
-from eval_utils import to_01
+from predictor.core.vae_predictor import VAEPredictor, TrajectoryDataset
+from predictor.conformal.conformal import CPQuantiles
+from predictor.evaluation.eval_utils import to_01
 
 
 def fit_pca_2d(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

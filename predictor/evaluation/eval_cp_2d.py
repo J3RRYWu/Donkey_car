@@ -17,7 +17,7 @@ import numpy as np
 from typing import Tuple, List
 from sklearn.decomposition import PCA
 
-from conformal import conformal_quantile, CPQuantiles
+from predictor.conformal.conformal import predictor.conformal.conformal_quantile, CPQuantiles
 
 
 def compute_cp_in_2d_pca_space(

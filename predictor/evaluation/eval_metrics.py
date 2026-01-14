@@ -9,8 +9,8 @@ import numpy as np
 from typing import Dict
 from torch.utils.data import DataLoader
 
-from vae_predictor import VAEPredictor
-from eval_utils import to_01, psnr_from_mse, ssim
+from predictor.core.vae_predictor import VAEPredictor
+from predictor.evaluation.eval_utils import to_01, psnr_from_mse, ssim
 
 
 def compute_baseline_vs_lstm(model: VAEPredictor, dataloader: DataLoader, device: torch.device, 
@@ -448,7 +448,7 @@ def compute_multi_step_rollout(model: VAEPredictor, dataloader: DataLoader, devi
                 print(f"  Horizon {h:2d}: img_mse={im:.6f}  psnr={curves[m]['psnr'][h]:.2f}  ssim={curves[m]['ssim'][h]:.3f}")
 
             # Effective horizon by thresholds
-            from eval_utils import effective_horizon_from_curve
+            from predictor.evaluation.eval_utils import effective_horizon_from_curve
             eff_psnr = effective_horizon_from_curve(curves[m]["psnr"], lambda x: x >= float(psnr_threshold))
             eff_ssim = effective_horizon_from_curve(curves[m]["ssim"], lambda x: x >= float(ssim_threshold))
             eff_mse = effective_horizon_from_curve(curves[m]["img_mse"], lambda x: x <= float(mse_threshold))

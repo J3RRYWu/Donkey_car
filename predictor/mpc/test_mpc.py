@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 
-from vae_predictor import VAEPredictor, TrajectoryDataset
-from conformal_mpc import ConformalMPC
+from predictor.core.vae_predictor import VAEPredictor, TrajectoryDataset
+from predictor.mpc.conformal_mpc import ConformalMPC
 
 
 def test_mpc_offline(args):
@@ -38,7 +38,7 @@ def test_mpc_offline(args):
     print("\n[1/5] Loading models...")
     
     # Load LSTM predictor (use load_model function)
-    from vae_predictor import load_model
+    from predictor.core.vae_predictor import load_model
     
     model = load_model(
         path=args.lstm_path,

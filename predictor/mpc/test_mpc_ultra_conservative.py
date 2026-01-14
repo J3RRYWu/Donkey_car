@@ -24,7 +24,7 @@ def test_mpc_ultra_conservative(args):
     
     # Load models
     print("\n[1/5] Loading models...")
-    from vae_predictor import load_model
+    from predictor.core.vae_predictor import load_model
     
     model = load_model(
         path=args.lstm_path,
@@ -41,7 +41,7 @@ def test_mpc_ultra_conservative(args):
     import os
     npz_paths = [os.path.join(args.data_dir, args.npz_file)]
     
-    from vae_predictor import TrajectoryDataset
+    from predictor.core.vae_predictor import TrajectoryDataset
     dataset = TrajectoryDataset(
         npz_paths=npz_paths,
         sequence_length=16,
@@ -53,7 +53,7 @@ def test_mpc_ultra_conservative(args):
     
     # Initialize MPC
     print("\n[3/5] Initializing MPC controller...")
-    from conformal_mpc import ConformalMPC
+    from predictor.mpc.conformal_mpc import ConformalMPC
     
     mpc = ConformalMPC(
         vae_model=model,

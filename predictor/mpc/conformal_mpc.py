@@ -417,7 +417,7 @@ def load_mpc_controller(
     Returns:
         mpc: ConformalMPC instance
     """
-    from vae_predictor import VAEPredictor
+    from predictor.core.vae_predictor import VAEPredictor
     
     # Load models
     vae_ckpt = torch.load(vae_path, map_location=device)

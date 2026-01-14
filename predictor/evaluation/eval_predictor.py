@@ -19,16 +19,16 @@ import matplotlib.pyplot as plt
 import csv
 import json
 
-from vae_predictor import VAEPredictor, TrajectoryDataset, load_model
-from eval_metrics import compute_baseline_vs_lstm, compute_multi_step_rollout
-from eval_visualization import visualize_predictions, visualize_rollout_images, generate_prediction_video
-from eval_conformal import visualize_cp_trajectory_band, visualize_cp_boundary_decode
-from conformal import CPQuantiles, nonconformity_scores, quantiles_per_horizon, coverage_per_horizon, set_size_summary
-from eval_utils import effective_horizon_from_curve
+from predictor.core.vae_predictor import VAEPredictor, TrajectoryDataset, load_model
+from predictor.evaluation.eval_metrics import compute_baseline_vs_lstm, compute_multi_step_rollout
+from predictor.evaluation.eval_visualization import visualize_predictions, visualize_rollout_images, generate_prediction_video
+from predictor.evaluation.eval_conformal import visualize_cp_trajectory_band, visualize_cp_boundary_decode
+from predictor.conformal.conformal import CPQuantiles, nonconformity_scores, quantiles_per_horizon, coverage_per_horizon, set_size_summary
+from predictor.evaluation.eval_utils import effective_horizon_from_curve
 
 # Import rigorous safety evaluation (optional, only if --cp_safety is used)
 try:
-    from eval_cp_safety import rigorous_cp_evaluation, export_safety_report
+    from predictor.evaluation.eval_cp_safety import rigorous_cp_evaluation, export_safety_report
     HAS_CP_SAFETY = True
 except ImportError:
     HAS_CP_SAFETY = False

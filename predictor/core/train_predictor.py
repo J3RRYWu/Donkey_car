@@ -14,7 +14,7 @@ from datetime import datetime
 import json
 
 from torch import amp
-from vae_predictor import (
+from predictor.core.vae_predictor import (
     VAEPredictor, TrajectoryDataset, train_epoch, validate_epoch,
     save_model, predictor_loss
 )
