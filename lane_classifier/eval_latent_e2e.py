@@ -52,8 +52,9 @@ class SequenceDataset(Dataset):
         context = frames[start_idx:start_idx + self.context_length]
         target = frames[start_idx + self.context_length]
         
-        return (torch.from_numpy(context).float(),
-                torch.from_numpy(target).float())
+        # Normalize uint8 [0, 255] to float [0, 1]
+        return (torch.from_numpy(context).float() / 255.0,
+                torch.from_numpy(target).float() / 255.0)
 
 
 def predict_and_classify_latent(vae, predictor, classifier, test_loader, device, num_samples=20):
