@@ -13,8 +13,8 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
-from cnn_model import get_model
-from dataset import create_dataloaders
+from lane_classifier.cnn_model import get_model
+from lane_classifier.dataset_visual import create_dataloaders
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
@@ -25,7 +25,12 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
     correct = 0
     total = 0
     
-    for batch_idx, (images, labels, ctes) in enumerate(train_loader):
+    for batch_idx, batch_data in enumerate(train_loader):
+        # Handle both 2-tuple (visual) and 3-tuple (CTE-based) datasets
+        if len(batch_data) == 3:
+            images, labels, ctes = batch_data
+        else:
+            images, labels = batch_data
         images = images.to(device)
         labels = labels.to(device)
         
@@ -74,7 +79,13 @@ def validate(model, val_loader, criterion, device):
     all_ctes = []
     
     with torch.no_grad():
-        for images, labels, ctes in val_loader:
+        for batch_data in val_loader:
+            # Handle both 2-tuple (visual) and 3-tuple (CTE-based) datasets
+            if len(batch_data) == 3:
+                images, labels, ctes = batch_data
+            else:
+                images, labels = batch_data
+                ctes = None
             images = images.to(device)
             labels = labels.to(device)
             
@@ -98,7 +109,8 @@ def validate(model, val_loader, criterion, device):
             # Store for confusion matrix
             all_predictions.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-            all_ctes.extend(ctes.numpy())
+            if ctes is not None:
+                all_ctes.extend(ctes.numpy())
     
     avg_loss = total_loss / len(val_loader)
     accuracy = 100. * correct / total

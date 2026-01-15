@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from lane_classifier.cnn_model import get_model as get_lane_model
 from vae_recon.vae_model_64x64 import SimpleVAE64x64, load_model_64x64
 from predictor.core.vae_predictor import VAEPredictor
+from lane_classifier.dataset_visual import LaneDatasetVisual
 
 
 def load_models(vae_path, predictor_path, cnn_path, device):
@@ -251,9 +252,43 @@ def predict_and_classify(vae_model, predictor, cnn_model, sequences, cte_thresho
             probabilities = torch.softmax(cnn_outputs, dim=1)  # (B, 2)
             predictions = cnn_outputs.argmax(1)  # (B,)
             
-            # Step 4: Get true labels from target CTE
-            # Match training definition: CTE < threshold → Right (1)
-            true_labels = (batch_target_cte < cte_threshold).astype(np.int64)
+            # Step 4: Get true labels using visual analysis (same as training)
+            # Use the same visual detection method as dataset_visual.py
+            batch_true_labels = []
+            for img in batch_target_frames:
+                # img is (C, H, W) numpy array in [0, 1]
+                img_np = img  # (C, H, W) in [0, 1]
+                
+                # Use the same red line detection logic
+                img_transposed = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
+                img_uint8 = (img_transposed * 255).astype(np.uint8)
+                
+                import cv2
+                hsv = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2HSV)
+                
+                lower_red1 = np.array([0, 50, 50])
+                upper_red1 = np.array([10, 255, 255])
+                lower_red2 = np.array([170, 50, 50])
+                upper_red2 = np.array([180, 255, 255])
+                
+                mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+                mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+                red_mask = mask1 | mask2
+                
+                h, w = red_mask.shape
+                y_coords, x_coords = np.where(red_mask > 0)
+                
+                if len(x_coords) == 0:
+                    red_x = 0.5
+                else:
+                    red_x = np.mean(x_coords) / w
+                
+                # Red line on RIGHT → car on LEFT (0)
+                # Red line on LEFT → car on RIGHT (1)
+                label = 0 if red_x > 0.5 else 1
+                batch_true_labels.append(label)
+            
+            true_labels = np.array(batch_true_labels, dtype=np.int64)
             
             # Store results
             all_predictions.extend(predictions.cpu().numpy())

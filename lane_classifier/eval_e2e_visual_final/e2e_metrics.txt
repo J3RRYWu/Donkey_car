@@ -1,0 +1,24 @@
+End-to-End Evaluation Results
+============================================================
+
+Models:
+  VAE: vae_recon/best_model.pt
+  Predictor: predictor/checkpoints/Donkey_car_checkpoints_best_model.pt
+  CNN: lane_classifier/checkpoints_visual/best_model.pt
+
+Data: ['traj1_64x64.npz', 'traj2_64x64.npz']
+Sequence Length: 16
+Prediction Horizon: 1
+
+Overall Accuracy: 27.40%
+ECE: 0.7260
+
+Classification Report:
+              precision    recall  f1-score   support
+
+       Right     0.0000    0.0000    0.0000     14052
+        Left     0.2740    1.0000    0.4302      5304
+
+    accuracy                         0.2740     19356
+   macro avg     0.1370    0.5000    0.2151     19356
+weighted avg     0.0751    0.2740    0.1179     19356

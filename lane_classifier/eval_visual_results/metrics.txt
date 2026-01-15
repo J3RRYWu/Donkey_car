@@ -1,0 +1,18 @@
+CNN Evaluation with Visual Labels
+============================================================
+
+Model: lane_classifier/checkpoints_visual/best_model.pt
+Validation samples: 1579
+
+Overall Accuracy: 96.45%
+ECE: 0.0304
+
+Classification Report:
+              precision    recall  f1-score   support
+
+        Left     0.9805    0.9486    0.9643       797
+       Right     0.9493    0.9808    0.9648       782
+
+    accuracy                         0.9645      1579
+   macro avg     0.9649    0.9647    0.9645      1579
+weighted avg     0.9650    0.9645    0.9645      1579
