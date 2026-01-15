@@ -126,6 +126,10 @@ def load_sequence_data(npz_paths, sequence_length=16, prediction_horizon=1):
     all_frames = np.concatenate(all_frames, axis=0)
     all_cte = np.concatenate(all_cte, axis=0)
     
+    # IMPORTANT: Invert CTE sign to match training data definition
+    # (Same as in lane_classifier/dataset.py)
+    all_cte = -all_cte
+    
     # Filter NaN
     valid_mask = ~np.isnan(all_cte)
     all_frames = all_frames[valid_mask]
@@ -210,27 +214,33 @@ def predict_and_classify(vae_model, predictor, cnn_model, sequences, cte_thresho
             # Reshape to sequence
             z_seq = z_input.view(B, T, *z_input.shape[1:])  # (B, T, latent_dim, 4, 4)
             
-            # Flatten spatial dimensions for LSTM
-            latent_dim, h, w = z_input.shape[1], z_input.shape[2], z_input.shape[3]
-            z_seq_flat = z_seq.view(B, T, -1)  # (B, T, latent_dim*4*4)
-            
-            # Add dummy actions if predictor uses actions
+            # Prepare actions if needed
+            actions_seq = None
             if predictor.action_dim > 0:
-                dummy_actions = torch.zeros(B, T, predictor.action_dim).to(device)
-                z_seq_with_actions = torch.cat([z_seq_flat, dummy_actions], dim=-1)
-            else:
-                z_seq_with_actions = z_seq_flat
+                actions_seq = torch.zeros(B, T, predictor.action_dim).to(device)
             
-            # LSTM prediction
-            if hasattr(predictor, 'lstm'):
-                lstm_out, _ = predictor.lstm(z_seq_with_actions)  # (B, T, hidden_size)
-                z_pred_flat = predictor.lstm_out(lstm_out[:, -1, :])  # (B, latent_dim*4*4)
-            else:
-                # Fallback: use last frame
-                z_pred_flat = z_seq_with_actions[:, -1, :latent_dim*h*w]
-            
-            # Reshape to spatial
-            z_pred = z_pred_flat.view(B, latent_dim, h, w)  # (B, latent_dim, 4, 4)
+            # Use the CORRECT prediction method (rollout from context)
+            # Predict 1 step into the future
+            try:
+                z_pred = predictor.rollout_from_context(
+                    z_context=z_seq,
+                    steps=1,
+                    a_full=actions_seq,
+                    context_action_len=T-1,
+                    start_action_index=T-1
+                )  # Returns (B, 1, latent_dim, 4, 4)
+                
+                z_pred = z_pred[:, 0, ...]  # (B, latent_dim, 4, 4)
+            except:
+                # Fallback: use predict method
+                if actions_seq is not None:
+                    z_pred = predictor.predict(z_seq, actions_seq)
+                else:
+                    z_pred = predictor.predict(z_seq)
+                
+                # If returns sequence, take last
+                if z_pred.dim() == 5:
+                    z_pred = z_pred[:, -1, ...]  # (B, latent_dim, 4, 4)
             
             # Step 2: VAE decodes predicted latent to image
             predicted_images = vae_model.decode(z_pred, skip_features=None)  # (B, 3, 64, 64)
@@ -242,7 +252,8 @@ def predict_and_classify(vae_model, predictor, cnn_model, sequences, cte_thresho
             predictions = cnn_outputs.argmax(1)  # (B,)
             
             # Step 4: Get true labels from target CTE
-            true_labels = (batch_target_cte >= cte_threshold).astype(np.int64)
+            # Match training definition: CTE < threshold → Right (1)
+            true_labels = (batch_target_cte < cte_threshold).astype(np.int64)
             
             # Store results
             all_predictions.extend(predictions.cpu().numpy())
@@ -371,8 +382,8 @@ def plot_results(predictions, probabilities, true_labels,
     
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Left', 'Right'],
-                yticklabels=['Left', 'Right'])
+                xticklabels=['Right', 'Left'],
+                yticklabels=['Right', 'Left'])
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title('Confusion Matrix (End-to-End)')
@@ -437,8 +448,8 @@ def plot_results(predictions, probabilities, true_labels,
         axes[i].imshow(combined)
         axes[i].axis('off')
         
-        pred_label = 'Left' if predictions[i] == 0 else 'Right'
-        true_label = 'Left' if true_labels[i] == 0 else 'Right'
+        pred_label = 'Right' if predictions[i] == 0 else 'Left'
+        true_label = 'Right' if true_labels[i] == 0 else 'Left'
         conf = probabilities[i, predictions[i]]
         color = 'green' if predictions[i] == true_labels[i] else 'red'
         
@@ -541,7 +552,7 @@ def main():
     
     print("\nClassification Report:")
     print(classification_report(true_labels, predictions, 
-                                target_names=['Left', 'Right'],
+                                target_names=['Right', 'Left'],
                                 digits=4))
     
     # Calculate ECE
@@ -574,7 +585,7 @@ def main():
         f.write(f"ECE: {ece:.4f}\n\n")
         f.write("Classification Report:\n")
         f.write(classification_report(true_labels, predictions,
-                                     target_names=['Left', 'Right'],
+                                     target_names=['Right', 'Left'],
                                      digits=4))
     
     print(f"\nSaved metrics to {metrics_path}")
