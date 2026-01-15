@@ -9,6 +9,56 @@ from torchvision import transforms
 import cv2
 
 
+def detect_red_line_position(img_uint8):
+    """
+    Detect the horizontal position of the red lane line
+    
+    Args:
+        img_uint8: (H, W, C) numpy array in uint8 [0, 255]
+    
+    Returns:
+        float: Horizontal center of mass of red pixels (0=left, 1=right)
+    """
+    # Convert to HSV for better red detection
+    hsv = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2HSV)
+    
+    # Red color range in HSV
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+    
+    # Create mask for red pixels
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = mask1 | mask2
+    
+    # Calculate horizontal center of mass
+    h, w = red_mask.shape
+    y_coords, x_coords = np.where(red_mask > 0)
+    
+    if len(x_coords) == 0:
+        return 0.5  # Default to center if no red detected
+    
+    red_x_normalized = np.mean(x_coords) / w
+    return red_x_normalized
+
+
+def get_visual_label(red_x):
+    """
+    Convert red line x position to label
+    
+    Args:
+        red_x: Normalized x position (0=left, 1=right)
+    
+    Returns:
+        int: 0 for Left, 1 for Right
+    """
+    # If red line is on right (x > 0.5) → car is on LEFT (label 0)
+    # If red line is on left (x < 0.5) → car is on RIGHT (label 1)
+    return 0 if red_x > 0.5 else 1
+
+
 class LaneDatasetVisual(Dataset):
     """
     Lane position dataset using visual analysis
