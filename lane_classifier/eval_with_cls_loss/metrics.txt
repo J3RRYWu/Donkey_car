@@ -1,0 +1,15 @@
+Latent Space End-to-End Evaluation
+==================================================
+
+Accuracy: 40.33%
+ECE: 0.5642
+
+Classification Report:
+              precision    recall  f1-score   support
+
+        Left     0.9649    0.1858    0.3116      2815
+       Right     0.3119    0.9820    0.4735      1058
+
+    accuracy                         0.4033      3873
+   macro avg     0.6384    0.5839    0.3925      3873
+weighted avg     0.7866    0.4033    0.3558      3873
