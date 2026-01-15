@@ -248,7 +248,13 @@ def predict_and_classify(vae_model, predictor, cnn_model, sequences, cte_thresho
             predicted_images = torch.clamp(predicted_images, 0, 1)
             
             # Step 3: CNN classifies predicted images
-            cnn_outputs = cnn_model(predicted_images)  # (B, 2)
+            # CRITICAL: Apply same normalization as training!
+            # CNN was trained with ImageNet normalization
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+            predicted_images_normalized = (predicted_images - mean) / std
+            
+            cnn_outputs = cnn_model(predicted_images_normalized)  # (B, 2)
             probabilities = torch.softmax(cnn_outputs, dim=1)  # (B, 2)
             predictions = cnn_outputs.argmax(1)  # (B,)
             
