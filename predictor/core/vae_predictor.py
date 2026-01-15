@@ -362,6 +362,111 @@ class VAEPredictor(nn.Module):
         
         return out
 
+    def predict_teacher_forcing(self, z_seq: torch.Tensor, a_seq: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """真正的Teacher Forcing: 逐步预测，每步使用真实的前一状态
+        
+        Args:
+            z_seq: (B, T, C, H, W) or (B, T, D) - 真实latent序列
+            a_seq: (B, T, action_dim) - 可选的action序列
+        
+        Returns:
+            z_pred: (B, T-1, ...) - 预测的latent序列（少一步，因为第一步无法预测）
+        """
+        if z_seq.dim() not in [3, 5]:
+            raise ValueError(f"Expected sequence input (B,T,...), got shape {tuple(z_seq.shape)}")
+        
+        z_flat, original_shape = self._flatten_latent(z_seq)  # (B, T, D)
+        B, T, D = z_flat.shape
+        
+        if T < 2:
+            raise ValueError(f"Sequence too short for teacher forcing, need T>=2, got T={T}")
+        
+        hidden = None
+        predictions = []
+        
+        # 逐步预测: 用z[t]预测z[t+1]
+        for t in range(T - 1):
+            x_in = z_flat[:, t, :]  # (B, D) - 使用真实的z[t]
+            
+            # 添加action（如果有）
+            if a_seq is not None:
+                if a_seq.dim() == 3 and t < a_seq.size(1):
+                    x_in = torch.cat([x_in, a_seq[:, t, :]], dim=-1)  # (B, D+A)
+            
+            # 单步LSTM/GRU
+            y, hidden = self._rnn_step(x_in, hidden)  # (B, D)
+            
+            # 残差连接: z_{t+1} = z_t + f(z_t, a_t)
+            if self.residual_prediction:
+                y = y + z_flat[:, t, :]
+            
+            predictions.append(y)
+        
+        # Stack predictions: (B, T-1, D)
+        out_flat = torch.stack(predictions, dim=1)
+        
+        # Reshape back to convolutional if needed
+        out = self._unflatten_latent(out_flat, original_shape)
+        
+        # Return (B, T-1, C, H, W) or (B, T-1, D)
+        return out
+    
+    def predict_scheduled_sampling(
+        self, 
+        z_seq: torch.Tensor, 
+        a_seq: Optional[torch.Tensor] = None,
+        teacher_forcing_prob: float = 0.5
+    ) -> torch.Tensor:
+        """Scheduled Sampling: 随机混合teacher forcing和autoregressive
+        
+        Args:
+            z_seq: (B, T, ...) - 真实latent序列
+            a_seq: (B, T, action_dim) - 可选的action序列
+            teacher_forcing_prob: 使用真实z的概率（1.0=纯TF, 0.0=纯autoregressive）
+        
+        Returns:
+            z_pred: (B, T-1, ...) - 预测的latent序列
+        """
+        if z_seq.dim() not in [3, 5]:
+            raise ValueError(f"Expected sequence input (B,T,...), got shape {tuple(z_seq.shape)}")
+        
+        z_flat, original_shape = self._flatten_latent(z_seq)
+        B, T, D = z_flat.shape
+        
+        if T < 2:
+            raise ValueError(f"Sequence too short, need T>=2, got T={T}")
+        
+        hidden = None
+        predictions = []
+        z_prev = z_flat[:, 0, :]  # 起始状态
+        
+        for t in range(T - 1):
+            # 随机决定: 使用真实z还是预测z
+            use_real = (torch.rand(1).item() < teacher_forcing_prob)
+            
+            if use_real:
+                x_in = z_flat[:, t, :]  # 使用真实z（teacher forcing）
+            else:
+                x_in = z_prev  # 使用上一步的预测z（autoregressive）
+            
+            # 添加action
+            if a_seq is not None and a_seq.dim() == 3 and t < a_seq.size(1):
+                x_in = torch.cat([x_in, a_seq[:, t, :]], dim=-1)
+            
+            # LSTM预测
+            y, hidden = self._rnn_step(x_in, hidden)
+            
+            # 残差
+            if self.residual_prediction:
+                y = y + x_in[..., :D]  # 只加latent部分，不加action
+            
+            predictions.append(y)
+            z_prev = y.detach()  # 用于下一步（如果需要）
+        
+        out_flat = torch.stack(predictions, dim=1)
+        out = self._unflatten_latent(out_flat, original_shape)
+        return out
+
     def _flatten_latent(self, z: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         """Flatten latent to (B, D) or (B, T, D) for RNN/MLP processing.
         Returns (z_flat, original_shape).
@@ -380,16 +485,27 @@ class VAEPredictor(nn.Module):
         return z_flat, original_shape
 
     def _unflatten_latent(self, z_flat: torch.Tensor, original_shape: Tuple[int, ...]) -> torch.Tensor:
-        """Reshape flat latent back to original convolutional format if needed."""
+        """Reshape flat latent back to original convolutional format if needed.
+        
+        Handles the case where z_flat has different T dimension than original_shape
+        (e.g., teacher forcing returns T-1 predictions from T inputs)
+        """
         if self.vae_encoder is None:
             return z_flat
+        
         # Convolutional latent
         if len(original_shape) == 4:
+            # (B, D) -> (B, C, H, W)
             return z_flat.view(original_shape)
-        if len(original_shape) == 5:
-            return z_flat.view(original_shape)
-        # Fallback
-        return z_flat.view(original_shape)
+        elif len(original_shape) == 5:
+            # (B, T', D) -> (B, T', C, H, W) where T' might != T
+            B_orig, T_orig, C, H, W = original_shape
+            B_flat, T_flat, D_flat = z_flat.shape
+            # Use actual T from z_flat, not from original_shape
+            return z_flat.view(B_flat, T_flat, C, H, W)
+        else:
+            # Fallback
+            return z_flat
 
     def _rnn_step(self, x_step: torch.Tensor, hidden):
         """Single-step forward through LSTM/GRU with dropout + output projection.
@@ -740,7 +856,8 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
                 detach_target: bool = True,  # Should be True when VAE is frozen
                 open_loop_steps: int = 0,
                 open_loop_weight: float = 0.0,
-                latent_sampling: bool = False) -> dict:
+                latent_sampling: bool = False,
+                teacher_forcing_prob: float = 1.0) -> dict:  # 1.0=纯TF, <1.0=scheduled sampling
     """Train one epoch"""
     model.train()
     total_loss = 0.0
@@ -822,13 +939,26 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
                 teacher_forcing = (target_offset == 1 and T_tgt == T_in)
 
                 if teacher_forcing:
+                    # 准备actions
                     actions_seq = None
                     if actions_full is not None:
                         actions_seq = actions_full[:, 0:T_in, :]
                         if hasattr(model, '_act_drop') and model._act_drop > 0:
                             mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
                             actions_seq = actions_seq * mask
-                    z_pred_seq = model.predict(z_input, actions_seq)
+                    
+                    # 根据teacher_forcing_prob选择TF或Scheduled Sampling
+                    if teacher_forcing_prob >= 1.0:
+                        # 纯Teacher Forcing: z[t] -> z[t+1]，返回(B, T-1, ...)
+                        z_pred_seq = model.predict_teacher_forcing(z_input, actions_seq)
+                    else:
+                        # Scheduled Sampling: 混合TF和autoregressive
+                        z_pred_seq = model.predict_scheduled_sampling(
+                            z_input, actions_seq, teacher_forcing_prob=teacher_forcing_prob
+                        )
+                    
+                    # 调整target: 预测的是z[1:T]，所以target应该是z_target[1:]
+                    z_target_seq = z_target_seq[:, 1:, ...]  # (B, T-1, ...)
                 else:
                     # Seq2seq rollout from context; actions are sliced internally.
                     if actions_full is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
@@ -979,13 +1109,26 @@ def train_epoch(model: VAEPredictor, dataloader: DataLoader,
 
             teacher_forcing = (target_offset == 1 and T_tgt == T_in)
             if teacher_forcing:
+                # 准备actions
                 actions_seq = None
                 if actions_full is not None:
                     actions_seq = actions_full[:, 0:T_in, :]
                     if hasattr(model, '_act_drop') and model._act_drop > 0:
                         mask = (torch.rand_like(actions_seq[..., :1]) > float(model._act_drop)).float()
                         actions_seq = actions_seq * mask
-                z_pred_seq = model.predict(z_input, actions_seq)
+                
+                # 根据teacher_forcing_prob选择TF或Scheduled Sampling
+                if teacher_forcing_prob >= 1.0:
+                    # 纯Teacher Forcing: z[t] -> z[t+1]，返回(B, T-1, ...)
+                    z_pred_seq = model.predict_teacher_forcing(z_input, actions_seq)
+                else:
+                    # Scheduled Sampling: 混合TF和autoregressive
+                    z_pred_seq = model.predict_scheduled_sampling(
+                        z_input, actions_seq, teacher_forcing_prob=teacher_forcing_prob
+                    )
+                
+                # 调整target: 预测的是z[1:T]，所以target应该是z_target[1:]
+                z_target_seq = z_target_seq[:, 1:, ...]  # (B, T-1, ...)
             else:
                 if actions_full is not None and hasattr(model, '_act_drop') and model._act_drop > 0:
                     mask = (torch.rand_like(actions_full[..., :1]) > float(model._act_drop)).float()

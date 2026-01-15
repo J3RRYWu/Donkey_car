@@ -135,6 +135,18 @@ def main():
                        help='Enable curriculum schedule for open_loop_steps based on epoch')
     parser.add_argument('--open_loop_schedule', type=str, default='0:5,10:10,20:20,40:50',
                        help="Open-loop curriculum schedule as 'epoch:steps,...' (0-based epoch). Example: 0:5,10:10,20:20,40:50")
+    
+    # Teacher Forcing / Scheduled Sampling arguments
+    parser.add_argument('--teacher_forcing_prob', type=float, default=1.0,
+                       help='Teacher forcing probability (1.0 = pure TF, <1.0 = scheduled sampling)')
+    parser.add_argument('--scheduled_sampling', action='store_true',
+                       help='Enable scheduled sampling curriculum (gradually reduce TF probability)')
+    parser.add_argument('--ss_start_prob', type=float, default=1.0,
+                       help='Starting teacher forcing probability for scheduled sampling')
+    parser.add_argument('--ss_end_prob', type=float, default=0.5,
+                       help='Ending teacher forcing probability for scheduled sampling')
+    parser.add_argument('--ss_decay_epochs', type=int, default=None,
+                       help='Number of epochs to decay TF prob from start to end (default: total epochs)')
     parser.add_argument('--commit_weight', type=float, default=0.0,
                        help='Commitment loss weight (not used for predictor)')
     parser.add_argument('--commit_eta', type=float, default=0.25,
@@ -363,6 +375,14 @@ def main():
         if current_open_loop_steps > 0:
             print(f"Open-loop steps this epoch: {current_open_loop_steps} (weight={args.open_loop_weight})")
 
+        # Scheduled Sampling: compute teacher_forcing_prob for this epoch
+        current_tf_prob = args.teacher_forcing_prob  # Default
+        if args.scheduled_sampling:
+            decay_epochs = args.ss_decay_epochs if args.ss_decay_epochs is not None else args.epochs
+            progress = min(1.0, epoch / max(1, decay_epochs))
+            current_tf_prob = args.ss_start_prob - progress * (args.ss_start_prob - args.ss_end_prob)
+            print(f"[Scheduled Sampling] teacher_forcing_prob = {current_tf_prob:.3f} (epoch {epoch+1}/{args.epochs})")
+
         # AMP stability guard for long open-loop
         scaler_this_epoch = None
         if args.use_amp and device.type == "cuda":
@@ -387,6 +407,7 @@ def main():
                 open_loop_steps=current_open_loop_steps,  # Enable open-loop rollout (curriculum)
                 open_loop_weight=args.open_loop_weight,
                 latent_sampling=bool(args.latent_sampling),
+                teacher_forcing_prob=current_tf_prob,  # Scheduled sampling support
             )
         else:
             # Default encoder: use full VAE loss with all options
@@ -401,6 +422,7 @@ def main():
                 open_loop_steps=current_open_loop_steps,
                 open_loop_weight=args.open_loop_weight,
                 latent_sampling=bool(args.latent_sampling),
+                teacher_forcing_prob=current_tf_prob,  # Scheduled sampling support
             )
         
         # Store metrics
