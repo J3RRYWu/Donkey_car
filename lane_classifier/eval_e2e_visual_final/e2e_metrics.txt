@@ -16,8 +16,8 @@ ECE: 0.7260
 Classification Report:
               precision    recall  f1-score   support
 
-       Right     0.0000    0.0000    0.0000     14052
-        Left     0.2740    1.0000    0.4302      5304
+        Left     0.0000    0.0000    0.0000     14052
+       Right     0.2740    1.0000    0.4302      5304
 
     accuracy                         0.2740     19356
    macro avg     0.1370    0.5000    0.2151     19356

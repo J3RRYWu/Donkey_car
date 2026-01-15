@@ -417,8 +417,8 @@ def plot_results(predictions, probabilities, true_labels,
     
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Right', 'Left'],
-                yticklabels=['Right', 'Left'])
+                xticklabels=['Left', 'Right'],
+                yticklabels=['Left', 'Right'])
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title('Confusion Matrix (End-to-End)')
@@ -483,8 +483,8 @@ def plot_results(predictions, probabilities, true_labels,
         axes[i].imshow(combined)
         axes[i].axis('off')
         
-        pred_label = 'Right' if predictions[i] == 0 else 'Left'
-        true_label = 'Right' if true_labels[i] == 0 else 'Left'
+        pred_label = 'Left' if predictions[i] == 0 else 'Right'
+        true_label = 'Left' if true_labels[i] == 0 else 'Right'
         conf = probabilities[i, predictions[i]]
         color = 'green' if predictions[i] == true_labels[i] else 'red'
         
@@ -587,7 +587,7 @@ def main():
     
     print("\nClassification Report:")
     print(classification_report(true_labels, predictions, 
-                                target_names=['Right', 'Left'],
+                                target_names=['Left', 'Right'],
                                 digits=4))
     
     # Calculate ECE
@@ -620,7 +620,7 @@ def main():
         f.write(f"ECE: {ece:.4f}\n\n")
         f.write("Classification Report:\n")
         f.write(classification_report(true_labels, predictions,
-                                     target_names=['Right', 'Left'],
+                                     target_names=['Left', 'Right'],
                                      digits=4))
     
     print(f"\nSaved metrics to {metrics_path}")
