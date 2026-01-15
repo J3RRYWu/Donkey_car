@@ -4,5 +4,8 @@ numpy
 matplotlib
 imageio
 Pillow
+scikit-learn
+seaborn
+tensorboard
 
 

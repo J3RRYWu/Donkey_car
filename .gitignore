@@ -12,6 +12,8 @@
 !predictor/**
 !vae_recon/
 !vae_recon/**
+!lane_classifier/
+!lane_classifier/**
 
 # ---- Python junk ----
 **/__pycache__/
@@ -46,5 +48,9 @@ predictor/checkpoints*/
 # VAE recon: exclude checkpoints
 vae_recon/checkpoints_64x64/
 vae_recon/checkpoints*/
+
+# Lane classifier: exclude checkpoints and eval results
+lane_classifier/checkpoints*/
+lane_classifier/eval_results*/
 
 
