@@ -1,0 +1,61 @@
+LSTM Open-Loop Rollout Metrics
+==================================================
+
+Context length: 10
+Rollout steps: 20
+Number of samples: 4
+
+Average MSE per step:
+  Step  1: 0.062044
+  Step  2: 0.059929
+  Step  3: 0.057317
+  Step  4: 0.054986
+  Step  5: 0.053588
+  Step  6: 0.049765
+  Step  7: 0.047303
+  Step  8: 0.044587
+  Step  9: 0.042379
+  Step 10: 0.040512
+  Step 11: 0.037807
+  Step 12: 0.037105
+  Step 13: 0.036482
+  Step 14: 0.035882
+  Step 15: 0.035676
+  Step 16: 0.035353
+  Step 17: 0.036221
+  Step 18: 0.037349
+  Step 19: 0.038362
+  Step 20: 0.039812
+
+Average PSNR per step:
+  Step  1: 12.10 dB
+  Step  2: 12.26 dB
+  Step  3: 12.47 dB
+  Step  4: 12.66 dB
+  Step  5: 12.79 dB
+  Step  6: 13.10 dB
+  Step  7: 13.32 dB
+  Step  8: 13.60 dB
+  Step  9: 13.85 dB
+  Step 10: 14.08 dB
+  Step 11: 14.38 dB
+  Step 12: 14.48 dB
+  Step 13: 14.57 dB
+  Step 14: 14.65 dB
+  Step 15: 14.68 dB
+  Step 16: 14.72 dB
+  Step 17: 14.60 dB
+  Step 18: 14.46 dB
+  Step 19: 14.31 dB
+  Step 20: 14.14 dB
+
+Initial prediction (step 1):
+  MSE:  0.062044
+  PSNR: 12.10 dB
+
+Long-term prediction (step 20):
+  MSE:  0.039812
+  PSNR: 14.14 dB
+
+Error growth (MSE increase):
+  0.64x worse at step 20

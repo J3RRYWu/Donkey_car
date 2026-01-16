@@ -1,0 +1,21 @@
+VAE Reconstruction Quality Metrics
+==================================================
+
+Number of test images: 100
+
+Summary Statistics:
+  Average MSE:  0.000378
+  Std MSE:      0.000118
+  Min MSE:      0.000164
+  Max MSE:      0.000789
+  Median MSE:   0.000361
+
+  Average PSNR: 34.42 dB
+  Std PSNR:     1.33 dB
+  Min PSNR:     31.03 dB
+  Max PSNR:     37.86 dB
+  Median PSNR:  34.43 dB
+
+Quality Assessment:
+  Overall quality: Excellent
+  (PSNR > 30dB: Excellent, 25-30: Good, 20-25: Fair, 15-20: Poor, <15: Very Poor)
